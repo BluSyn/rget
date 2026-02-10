@@ -3,10 +3,12 @@ use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::{header, Client};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use url::Url;
 
 #[derive(Parser)]
@@ -37,10 +39,10 @@ async fn main() -> Result<()> {
     let url = Url::parse(&args.url).context("Invalid URL")?;
     let client = Client::builder()
         .user_agent("rget/0.1 (multi-connection downloader)")
-        .pool_idle_timeout(std::time::Duration::from_secs(30))
+        .pool_idle_timeout(Duration::from_secs(30))
         .build()?;
 
-    // HEAD to get metadata
+    // ─── HEAD ────────────────────────────────────────────────────────
     let head = client.head(url.as_str()).send().await?;
     if !head.status().is_success() {
         bail!(
@@ -64,7 +66,7 @@ async fn main() -> Result<()> {
         .map_or(false, |v| v.contains("bytes"));
 
     if !accept_ranges && args.connections > 1 {
-        eprintln!("Warning: Server does not support ranges → using single connection");
+        eprintln!("Warning: Server does not advertise range support → using single connection");
     }
 
     let filename = args.output.unwrap_or_else(|| {
@@ -88,7 +90,7 @@ async fn main() -> Result<()> {
         content_length, args.connections
     );
 
-    // Pre-allocate the file
+    // Pre-allocate
     fs::create_dir_all(filename.parent().unwrap_or(Path::new("."))).await?;
     {
         let file = OpenOptions::new()
@@ -101,15 +103,28 @@ async fn main() -> Result<()> {
     }
 
     let mp = MultiProgress::new();
-    let sty = ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+
+    // ─── Main (total) progress bar ──────────────────────────────────
+    let main_style = ProgressStyle::default_bar()
+        .template("{spinner:.cyan} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
         .unwrap()
         .progress_chars("#>-");
 
     let main_pb = mp.add(ProgressBar::new(content_length));
-    main_pb.set_style(sty.clone());
+    main_pb.set_style(main_style);
 
-    // Chunking
+    // ─── Per-chunk style ────────────────────────────────────────────
+    let chunk_style = ProgressStyle::default_bar()
+        .template("{spinner:.blue} [{elapsed_precise}] [{wide_bar:.blue}] {bytes}/{total_bytes} ({bytes_per_sec})")
+        .unwrap()
+        .progress_chars("=>-");
+
+    // Shared state for total speed calculation
+    let total_bytes_downloaded = Arc::new(Mutex::new(0u64));
+    let total_last_bytes = Arc::new(Mutex::new(0u64));
+    let total_last_time = Arc::new(Mutex::new(Instant::now()));
+
+    // ─── Chunking ───────────────────────────────────────────────────
     let effective_n = if accept_ranges {
         args.connections.max(1)
     } else {
@@ -125,16 +140,19 @@ async fn main() -> Result<()> {
         start = end + 1;
     }
 
-    // Spawn tasks — each opens its own File handle
     let mut tasks = Vec::new();
     let path_clone = filename.clone();
 
     for (i, (range_start, range_end)) in chunks.into_iter().enumerate() {
         let pb = mp.insert(i + 1, ProgressBar::new(range_end - range_start + 1));
-        pb.set_style(sty.clone());
-        pb.set_prefix(format!("Chunk {} ", i + 1));
+        pb.set_style(chunk_style.clone());
+        pb.set_prefix(format!("Chunk {:2} ", i + 1));
 
         let main_pb_clone = main_pb.clone();
+        let total_bytes_arc = total_bytes_downloaded.clone();
+        let total_last_bytes_arc = total_last_bytes.clone();
+        let total_last_time_arc = total_last_time.clone();
+
         let client = client.clone();
         let url_str = url.to_string();
         let range_header = format!("bytes={}-{}", range_start, range_end);
@@ -161,11 +179,58 @@ async fn main() -> Result<()> {
                 .await
                 .context("Seek failed")?;
 
+            let mut chunk_bytes = 0u64;
+            let mut last_bytes = 0u64;
+            let mut last_time = Instant::now();
+
             while let Ok(Some(chunk)) = resp.chunk().await {
                 file.write_all(&chunk).await?;
+
                 let len = chunk.len() as u64;
+                chunk_bytes += len;
+
+                // Update chunk bar
                 pb.inc(len);
-                main_pb_clone.inc(len);
+
+                // Update total
+                {
+                    let mut total = total_bytes_arc.lock().await;
+                    *total += len;
+                    main_pb_clone.set_position(*total);
+                }
+
+                // Update total speed ~every 400ms
+                let now = Instant::now();
+                if now.duration_since(last_time) >= Duration::from_millis(400) {
+                    let delta_bytes = chunk_bytes - last_bytes;
+                    let delta_time = now.duration_since(last_time).as_secs_f64().max(0.001);
+                    let speed_mib_s = (delta_bytes as f64) / delta_time / 1_048_576.0;
+
+                    pb.set_message(format!("{:.1} MiB/s", speed_mib_s));
+
+                    last_bytes = chunk_bytes;
+                    last_time = now;
+                }
+
+                // Update global total speed
+                {
+                    let mut last_total_bytes = total_last_bytes_arc.lock().await;
+                    let mut last_total_time = total_last_time_arc.lock().await;
+
+                    let delta_total = chunk_bytes - *last_total_bytes;
+                    let delta_t = now
+                        .duration_since(*last_total_time)
+                        .as_secs_f64()
+                        .max(0.001);
+
+                    if delta_t > 0.0 {
+                        let total_speed = (delta_total as f64) / delta_t / 1_048_576.0;
+                        main_pb_clone.set_message(format!("{:.1} MiB/s", total_speed));
+                    }
+
+                    *last_total_bytes = chunk_bytes;
+                    *last_total_time = now;
+                }
             }
 
             pb.finish_with_message("✓");
@@ -173,39 +238,16 @@ async fn main() -> Result<()> {
         }));
     }
 
-    // Wait for completion
+    // Wait for all chunks
     for task in tasks {
         task.await??;
     }
 
+    // ─── Summary ─────────────────────────────────────────────────────
     let total_duration = start_time.elapsed();
     let total_seconds = total_duration.as_secs_f64().max(0.001);
-    let bytes_f64 = content_length as f64;
-    let avg_speed_mib_s = bytes_f64 / total_seconds / 1_048_576.0;
-    let avg_speed_mb_s = bytes_f64 / total_seconds / 1_000_000.0;
-
-    // Compute SHA-256 using external sha256sum command
-    let hash_hex = match Command::new("sha256sum").arg(&filename).output().await {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout
-                .split_whitespace()
-                .next()
-                .unwrap_or("failed-to-parse")
-                .to_string()
-        }
-        Ok(output) => {
-            eprintln!(
-                "sha256sum failed with exit code: {:?}",
-                output.status.code()
-            );
-            "error".to_string()
-        }
-        Err(e) => {
-            eprintln!("Failed to run sha256sum: {}", e);
-            "not-available".to_string()
-        }
-    };
+    let avg_speed_mib_s = (content_length as f64) / total_seconds / 1_048_576.0;
+    let avg_speed_mb_s = (content_length as f64) / total_seconds / 1_000_000.0;
 
     main_pb.finish_with_message("Download complete");
     mp.clear()?;
@@ -216,6 +258,39 @@ async fn main() -> Result<()> {
         "Average speed:     {:.2} MiB/s  ({:.2} MB/s)",
         avg_speed_mib_s, avg_speed_mb_s
     );
+
+    // ─── SHA-256 with spinner ───────────────────────────────────────
+    println!("Computing SHA-256...");
+
+    let hash_spinner = ProgressBar::new_spinner();
+    hash_spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap(),
+    );
+    hash_spinner.enable_steady_tick(Duration::from_millis(120));
+    hash_spinner.set_message("Running sha256sum...");
+
+    let output = Command::new("sha256sum").arg(&filename).output().await;
+
+    hash_spinner.finish_and_clear();
+
+    let hash_hex = match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap_or("parse-error")
+            .to_string(),
+        Ok(out) => {
+            eprintln!("sha256sum exited with code {:?}", out.status.code());
+            "error".to_string()
+        }
+        Err(e) => {
+            eprintln!("Cannot run sha256sum: {}", e);
+            "not-available".to_string()
+        }
+    };
+
     println!("SHA-256:           {}", hash_hex);
 
     Ok(())
