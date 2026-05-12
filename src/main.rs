@@ -4,14 +4,14 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::{header, Client};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::net::lookup_host;
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use url::Url;
 
 #[derive(Parser)]
@@ -214,10 +214,22 @@ async fn main() -> Result<()> {
     let mut tasks = Vec::new();
     let path_clone = filename.clone();
 
-    // Per-chunk shared state for the "slowest chunk" supervisor.
+    // Per-chunk shared state used by the supervisor.
+    //
+    // `restart_notify` lets the supervisor cancel an in-flight attempt; the
+    // task notices it via `select!` and re-issues a ranged GET starting at
+    // its current write offset. `lagging_since` records when the chunk
+    // first qualified as the lone laggard (so we only fire a restart after
+    // the lag has been sustained for a while). `cooldown_until` blocks
+    // re-evaluation right after a restart so the new connection has time
+    // to ramp up before we judge it.
     struct ChunkSpeed {
         started: AtomicBool,
         done: AtomicBool,
+        restart_count: AtomicUsize,
+        lagging_since: Mutex<Option<Instant>>,
+        cooldown_until: Mutex<Option<Instant>>,
+        restart_notify: Notify,
     }
     let chunk_count = chunks.len();
     let chunk_speeds: Vec<Arc<ChunkSpeed>> = (0..chunk_count)
@@ -225,10 +237,23 @@ async fn main() -> Result<()> {
             Arc::new(ChunkSpeed {
                 started: AtomicBool::new(false),
                 done: AtomicBool::new(false),
+                restart_count: AtomicUsize::new(0),
+                lagging_since: Mutex::new(None),
+                cooldown_until: Mutex::new(None),
+                restart_notify: Notify::new(),
             })
         })
         .collect();
     let mut chunk_pbs: Vec<ProgressBar> = Vec::with_capacity(chunk_count);
+
+    // Style applied briefly when a chunk is being restarted.
+    let chunk_style_restart = ProgressStyle::default_bar()
+        .template("{spinner:.yellow} [{elapsed_precise}] [{wide_bar:.yellow}] {bytes}/{total_bytes} ({bytes_per_sec}) {msg}")
+        .unwrap()
+        .progress_chars("=>-");
+
+    // Hard cap on attempts per chunk: 1 initial + 1 restart.
+    const MAX_ATTEMPTS: usize = 2;
 
     for (i, (range_start, range_end)) in chunks.into_iter().enumerate() {
         let pb = mp.insert(i + 1, ProgressBar::new(range_end - range_start + 1));
@@ -244,22 +269,12 @@ async fn main() -> Result<()> {
 
         let client = client.clone();
         let url_str = url.to_string();
-        let range_header = format!("bytes={}-{}", range_start, range_end);
         let path_for_task = path_clone.clone();
         let done_style = chunk_style_done.clone();
+        let restart_style = chunk_style_restart.clone();
 
         tasks.push(tokio::spawn(async move {
             chunk_speed.started.store(true, Ordering::Relaxed);
-
-            let mut resp = client
-                .get(&url_str)
-                .header(header::RANGE, &range_header)
-                .send()
-                .await?;
-
-            if !resp.status().is_success() {
-                anyhow::bail!("Range request failed: {}", resp.status());
-            }
 
             let mut file = OpenOptions::new()
                 .write(true)
@@ -267,60 +282,126 @@ async fn main() -> Result<()> {
                 .await
                 .context("Failed to open file in chunk task")?;
 
-            file.seek(std::io::SeekFrom::Start(range_start))
-                .await
-                .context("Seek failed")?;
+            // Bytes already written for this chunk (persists across restart).
+            let mut chunk_bytes: u64 = 0;
 
-            let mut chunk_bytes = 0u64;
-            let mut last_bytes = 0u64;
-            let mut last_time = Instant::now();
+            'attempts: for attempt in 0..MAX_ATTEMPTS {
+                let abs_start = range_start + chunk_bytes;
+                let range_header = format!("bytes={}-{}", abs_start, range_end);
 
-            while let Ok(Some(chunk)) = resp.chunk().await {
-                file.write_all(&chunk).await?;
+                file.seek(std::io::SeekFrom::Start(abs_start))
+                    .await
+                    .context("Seek failed")?;
 
-                let len = chunk.len() as u64;
-                chunk_bytes += len;
+                let mut resp = client
+                    .get(&url_str)
+                    .header(header::RANGE, &range_header)
+                    .send()
+                    .await?;
 
-                // Update chunk bar
-                pb.inc(len);
-
-                // Update total (and snapshot it for global speed calc)
-                let total_snapshot = {
-                    let mut total = total_bytes_arc.lock().await;
-                    *total += len;
-                    main_pb_clone.set_position(*total);
-                    *total
-                };
-
-                // Update chunk speed ~every 400ms
-                let now = Instant::now();
-                if now.duration_since(last_time) >= Duration::from_millis(400) {
-                    let delta_bytes = chunk_bytes.saturating_sub(last_bytes);
-                    let delta_time = now.duration_since(last_time).as_secs_f64().max(0.001);
-                    let speed_mib_s = (delta_bytes as f64) / delta_time / 1_048_576.0;
-
-                    pb.set_message(format!("{:.1} MiB/s", speed_mib_s));
-
-                    last_bytes = chunk_bytes;
-                    last_time = now;
+                if !resp.status().is_success() {
+                    anyhow::bail!("Range request failed: {}", resp.status());
                 }
 
-                // Update global total speed (rate-limited so all tasks
-                // don't fight to overwrite it on every chunk callback).
-                {
-                    let mut last_total_bytes = total_last_bytes_arc.lock().await;
-                    let mut last_total_time = total_last_time_arc.lock().await;
+                // Reset speed-sample baseline at the start of each attempt
+                // so we don't show an artificial spike right after a restart.
+                let mut last_bytes = chunk_bytes;
+                let mut last_time = Instant::now();
+                let mut cancelled = false;
 
-                    let delta_t = now.duration_since(*last_total_time).as_secs_f64();
-                    if delta_t >= 0.4 {
-                        let delta_total = total_snapshot.saturating_sub(*last_total_bytes);
-                        let total_speed = (delta_total as f64) / delta_t.max(0.001) / 1_048_576.0;
-                        main_pb_clone.set_message(format!("{:.1} MiB/s", total_speed));
+                // Only the initial attempt is cancellable. After we've used
+                // our one allowed restart, we ride out the second attempt.
+                let cancel_enabled = attempt + 1 < MAX_ATTEMPTS;
+                let cancel_fut = chunk_speed.restart_notify.notified();
+                tokio::pin!(cancel_fut);
 
-                        *last_total_bytes = total_snapshot;
-                        *last_total_time = now;
+                loop {
+                    let next_chunk = if cancel_enabled {
+                        tokio::select! {
+                            biased;
+                            _ = &mut cancel_fut => {
+                                cancelled = true;
+                                None
+                            }
+                            r = resp.chunk() => Some(r),
+                        }
+                    } else {
+                        Some(resp.chunk().await)
+                    };
+
+                    if cancelled {
+                        break;
+                    }
+                    let chunk = match next_chunk.unwrap() {
+                        Ok(Some(c)) => c,
+                        Ok(None) => break,
+                        Err(e) => return Err(e.into()),
+                    };
+
+                    file.write_all(&chunk).await?;
+                    let len = chunk.len() as u64;
+                    chunk_bytes += len;
+
+                    pb.inc(len);
+
+                    let total_snapshot = {
+                        let mut total = total_bytes_arc.lock().await;
+                        *total += len;
+                        main_pb_clone.set_position(*total);
+                        *total
+                    };
+
+                    let now = Instant::now();
+                    if now.duration_since(last_time) >= Duration::from_millis(400) {
+                        let delta_bytes = chunk_bytes.saturating_sub(last_bytes);
+                        let delta_time = now.duration_since(last_time).as_secs_f64().max(0.001);
+                        let speed_mib_s = (delta_bytes as f64) / delta_time / 1_048_576.0;
+
+                        pb.set_message(format!("{:.1} MiB/s", speed_mib_s));
+
+                        last_bytes = chunk_bytes;
+                        last_time = now;
+                    }
+
+                    {
+                        let mut last_total_bytes = total_last_bytes_arc.lock().await;
+                        let mut last_total_time = total_last_time_arc.lock().await;
+
+                        let delta_t = now.duration_since(*last_total_time).as_secs_f64();
+                        if delta_t >= 0.4 {
+                            let delta_total = total_snapshot.saturating_sub(*last_total_bytes);
+                            let total_speed =
+                                (delta_total as f64) / delta_t.max(0.001) / 1_048_576.0;
+                            main_pb_clone.set_message(format!("{:.1} MiB/s", total_speed));
+
+                            *last_total_bytes = total_snapshot;
+                            *last_total_time = now;
+                        }
                     }
                 }
+
+                if cancelled {
+                    // Drop the response (closes connection) and reset state
+                    // for the next attempt.
+                    drop(resp);
+                    chunk_speed.restart_count.fetch_add(1, Ordering::Relaxed);
+                    *chunk_speed.lagging_since.lock().await = None;
+                    *chunk_speed.cooldown_until.lock().await =
+                        Some(Instant::now() + Duration::from_secs(15));
+
+                    pb.set_style(restart_style.clone());
+                    pb.set_message("restarting…");
+                    pb.println(format!(
+                        "Chunk {:2}: restarting at {}/{} bytes ({:.1}%)",
+                        i + 1,
+                        chunk_bytes,
+                        range_end - range_start + 1,
+                        100.0 * chunk_bytes as f64 / (range_end - range_start + 1) as f64
+                    ));
+                    continue 'attempts;
+                }
+
+                break;
             }
 
             chunk_speed.done.store(true, Ordering::Relaxed);
@@ -330,14 +411,21 @@ async fn main() -> Result<()> {
         }));
     }
 
-    // ─── "Slowest chunk" supervisor ─────────────────────────────────
-    // Periodically inspects every active chunk's completion percentage
-    // and applies a red style to whichever is furthest behind. We wait
-    // until overall download has crossed a threshold before highlighting,
-    // since chunks can start at slightly different times and very-early
-    // percentages are meaningless. Highlighting the chunk with the lowest
-    // completion is relatively stable, reducing flickering.
+    // ─── Supervisor: highlight slowest chunk + restart stuck chunks ─
+    // Highlighting: once total download passes HIGHLIGHT_AFTER_FRACTION,
+    // the active chunk with the lowest completion is shown red. Stable
+    // and flicker-free.
+    //
+    // Restart: only fires under tight conditions to avoid wasted work.
+    //   - At most 2 chunks still active (everyone else is done) AND
+    //     at least 1 chunk has finished (the link demonstrably works), AND
+    //   - Laggard's completion < 30%, AND
+    //   - The lag has been sustained for ≥15s (no transient stalls), AND
+    //   - The chunk hasn't already been restarted, AND
+    //   - We're not in the post-restart cooldown window.
     const HIGHLIGHT_AFTER_FRACTION: f64 = 0.10;
+    const RESTART_FRACTION_CEILING: f64 = 0.30;
+    const RESTART_SUSTAINED_SECS: u64 = 15;
     let supervisor_speeds = chunk_speeds.clone();
     let supervisor_pbs = chunk_pbs.clone();
     let supervisor_total = total_bytes_downloaded.clone();
@@ -350,43 +438,50 @@ async fn main() -> Result<()> {
         loop {
             tick.tick().await;
 
-            // Don't highlight anything until we're past the warm-up phase.
             let total_so_far = *supervisor_total.lock().await;
             let overall_fraction = total_so_far as f64 / content_length as f64;
 
+            // Build the active list once; reuse for both highlight + restart.
+            let mut active: Vec<(usize, f64)> = supervisor_speeds
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| {
+                    if !s.started.load(Ordering::Relaxed) || s.done.load(Ordering::Relaxed) {
+                        return None;
+                    }
+                    let pb = &supervisor_pbs[i];
+                    let len = pb.length().unwrap_or(0);
+                    if len == 0 {
+                        return None;
+                    }
+                    let frac = pb.position() as f64 / len as f64;
+                    Some((i, frac))
+                })
+                .collect();
+            active.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let finished_count = supervisor_speeds
+                .iter()
+                .filter(|s| s.done.load(Ordering::Relaxed))
+                .count();
+
+            // ── Slowest-chunk highlight ─────────────────────────────
             let mut want_slow = vec![false; supervisor_speeds.len()];
-
-            if overall_fraction >= HIGHLIGHT_AFTER_FRACTION {
-                // Collect (index, completion_fraction) for chunks that are
-                // running (started but not finished).
-                let mut active: Vec<(usize, f64)> = supervisor_speeds
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, s)| {
-                        if !s.started.load(Ordering::Relaxed) || s.done.load(Ordering::Relaxed) {
-                            return None;
-                        }
-                        let pb = &supervisor_pbs[i];
-                        let len = pb.length().unwrap_or(0);
-                        if len == 0 {
-                            return None;
-                        }
-                        let frac = pb.position() as f64 / len as f64;
-                        Some((i, frac))
-                    })
-                    .collect();
-
-                // Need at least 2 active chunks for "slowest" to be meaningful.
-                if active.len() >= 2 {
-                    active
-                        .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                    want_slow[active[0].0] = true;
-                }
+            if overall_fraction >= HIGHLIGHT_AFTER_FRACTION && active.len() >= 2 {
+                want_slow[active[0].0] = true;
             }
-
             for (i, pb) in supervisor_pbs.iter().enumerate() {
-                // Don't fight the task's own done-style assignment.
                 if supervisor_speeds[i].done.load(Ordering::Relaxed) {
+                    continue;
+                }
+                // Don't override the yellow restart style.
+                if supervisor_speeds[i].restart_count.load(Ordering::Relaxed) > 0
+                    && supervisor_speeds[i]
+                        .cooldown_until
+                        .lock()
+                        .await
+                        .is_some_and(|t| Instant::now() < t)
+                {
                     continue;
                 }
                 if want_slow[i] != current_slow[i] {
@@ -397,6 +492,40 @@ async fn main() -> Result<()> {
                     });
                     current_slow[i] = want_slow[i];
                 }
+            }
+
+            // ── Restart trigger ─────────────────────────────────────
+            // Conditions: ≤2 active, ≥1 done, laggard < 30%, ≥5× behind
+            // next-slowest, lag sustained ≥15s, not already restarted,
+            // not in cooldown.
+            if active.len() > 2 || active.is_empty() || finished_count == 0 {
+                continue;
+            }
+            let (slowest_idx, slowest_frac) = active[0];
+            let state = &supervisor_speeds[slowest_idx];
+
+            if state.restart_count.load(Ordering::Relaxed) >= 1 {
+                continue;
+            }
+            if let Some(t) = *state.cooldown_until.lock().await {
+                if Instant::now() < t {
+                    continue;
+                }
+            }
+
+            let frac_ok = slowest_frac < RESTART_FRACTION_CEILING;
+
+            if frac_ok {
+                let mut lag = state.lagging_since.lock().await;
+                let since = lag.get_or_insert_with(Instant::now);
+                if Instant::now().duration_since(*since)
+                    >= Duration::from_secs(RESTART_SUSTAINED_SECS)
+                {
+                    drop(lag);
+                    state.restart_notify.notify_one();
+                }
+            } else {
+                *state.lagging_since.lock().await = None;
             }
         }
     });
@@ -480,7 +609,7 @@ async fn probe_metadata(client: &Client, url: &str) -> Result<(u64, bool, Option
             .headers()
             .get(header::ACCEPT_RANGES)
             .and_then(|v| v.to_str().ok())
-            .map_or(false, |v| v.contains("bytes"));
+            .is_some_and(|v| v.contains("bytes"));
         let cd = head
             .headers()
             .get(header::CONTENT_DISPOSITION)
