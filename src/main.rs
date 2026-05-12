@@ -250,17 +250,18 @@ async fn main() -> Result<()> {
                 // Update chunk bar
                 pb.inc(len);
 
-                // Update total
-                {
+                // Update total (and snapshot it for global speed calc)
+                let total_snapshot = {
                     let mut total = total_bytes_arc.lock().await;
                     *total += len;
                     main_pb_clone.set_position(*total);
-                }
+                    *total
+                };
 
                 // Update total speed ~every 400ms
                 let now = Instant::now();
                 if now.duration_since(last_time) >= Duration::from_millis(400) {
-                    let delta_bytes = chunk_bytes - last_bytes;
+                    let delta_bytes = chunk_bytes.saturating_sub(last_bytes);
                     let delta_time = now.duration_since(last_time).as_secs_f64().max(0.001);
                     let speed_mib_s = (delta_bytes as f64) / delta_time / 1_048_576.0;
 
@@ -270,24 +271,25 @@ async fn main() -> Result<()> {
                     last_time = now;
                 }
 
-                // Update global total speed
+                // Update global total speed (rate-limited so all tasks
+                // don't fight to overwrite it on every chunk callback).
                 {
                     let mut last_total_bytes = total_last_bytes_arc.lock().await;
                     let mut last_total_time = total_last_time_arc.lock().await;
 
-                    let delta_total = chunk_bytes - *last_total_bytes;
-                    let delta_t = now
-                        .duration_since(*last_total_time)
-                        .as_secs_f64()
-                        .max(0.001);
-
-                    if delta_t > 0.0 {
-                        let total_speed = (delta_total as f64) / delta_t / 1_048_576.0;
+                    let delta_t = now.duration_since(*last_total_time).as_secs_f64();
+                    if delta_t >= 0.4 {
+                        // saturating_sub avoids underflow in the unlikely case
+                        // last_total_bytes was set ahead of our snapshot by
+                        // another task between the two locked sections.
+                        let delta_total = total_snapshot.saturating_sub(*last_total_bytes);
+                        let total_speed =
+                            (delta_total as f64) / delta_t.max(0.001) / 1_048_576.0;
                         main_pb_clone.set_message(format!("{:.1} MiB/s", total_speed));
-                    }
 
-                    *last_total_bytes = chunk_bytes;
-                    *last_total_time = now;
+                        *last_total_bytes = total_snapshot;
+                        *last_total_time = now;
+                    }
                 }
             }
 
