@@ -461,6 +461,11 @@ async fn main() -> Result<()> {
     // the active chunk with the lowest completion is shown red. Stable
     // and flicker-free.
     //
+    // Hung-connection detection (mode-independent):
+    //   - Any active chunk that has transferred fewer than
+    //     HUNG_BYTES_THRESHOLD bytes in HUNG_DURATION_SECS is force-restarted,
+    //     subject to the same restart-count + cooldown guards as below.
+    //
     // Restart conditions (default mode): only fires under tight conditions
     // to avoid wasted work.
     //   - At most 2 chunks still active (everyone else is done) AND
@@ -479,6 +484,8 @@ async fn main() -> Result<()> {
     const RESTART_FRACTION_CEILING: f64 = 0.50;
     const RESTART_SUSTAINED_SECS_DEFAULT: u64 = 10;
     const RESTART_SUSTAINED_SECS_AGGRESSIVE: u64 = 5;
+    const HUNG_DURATION_SECS: u64 = 15;
+    const HUNG_BYTES_THRESHOLD: u64 = 64 * 1024; // 64 KiB
     let aggressive = args.aggressive;
     let supervisor_speeds = chunk_speeds.clone();
     let supervisor_pbs = chunk_pbs.clone();
@@ -489,9 +496,15 @@ async fn main() -> Result<()> {
         let mut tick = tokio::time::interval(Duration::from_millis(500));
         tick.tick().await; // discard the immediate first tick
         let mut current_slow: Vec<bool> = vec![false; supervisor_speeds.len()];
+        // Per-chunk (last_observed_position, last_observed_time) used by the
+        // hung-connection detector. Lazy-initialised the first time we see
+        // each chunk active.
+        let mut last_progress: Vec<Option<(u64, Instant)>> =
+            vec![None; supervisor_speeds.len()];
         loop {
             tick.tick().await;
 
+            let now = Instant::now();
             let total_so_far = supervisor_total.load(Ordering::Relaxed);
             let overall_fraction = total_so_far as f64 / content_length as f64;
 
@@ -546,6 +559,49 @@ async fn main() -> Result<()> {
                     });
                     current_slow[i] = want_slow[i];
                 }
+            }
+
+            // ── Hung-connection detection (mode-independent) ────────
+            // Force-restart any active chunk that hasn't transferred at
+            // least HUNG_BYTES_THRESHOLD bytes within HUNG_DURATION_SECS.
+            // Same restart-count + cooldown guards as the lag-based path,
+            // so MAX_ATTEMPTS is preserved (no endless loop).
+            for &(i, _) in &active {
+                let state = &supervisor_speeds[i];
+                if state.restart_count.load(Ordering::Relaxed) >= 1 {
+                    continue;
+                }
+                let pb = &supervisor_pbs[i];
+                let pos = pb.position();
+                let entry = last_progress[i].get_or_insert((pos, now));
+                let bytes_progressed = pos.saturating_sub(entry.0);
+                if bytes_progressed >= HUNG_BYTES_THRESHOLD {
+                    *entry = (pos, now);
+                    continue;
+                }
+                if now.duration_since(entry.1) < Duration::from_secs(HUNG_DURATION_SECS) {
+                    continue;
+                }
+                if state
+                    .cooldown_until
+                    .lock()
+                    .expect("cooldown_until mutex poisoned")
+                    .is_some_and(|t| now < t)
+                {
+                    continue;
+                }
+                pb.println(format!(
+                    "Chunk {:2}: hung (<{} bytes in {}s) — forcing restart",
+                    i + 1,
+                    HUNG_BYTES_THRESHOLD,
+                    HUNG_DURATION_SECS
+                ));
+                state.restart_notify.notify_one();
+                // Reset our local baseline so we don't re-fire on the next
+                // tick before the new connection has had a chance to ramp
+                // up. (The cooldown guard above is the authoritative gate;
+                // this just keeps the local tracker tidy.)
+                *entry = (pos, now);
             }
 
             // ── Restart trigger ─────────────────────────────────────
