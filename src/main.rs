@@ -49,6 +49,14 @@ struct Args {
     /// (Default supervisor only restarts when ≤2 connections remain active.)
     #[arg(long)]
     aggressive: bool,
+
+    /// Overwrite existing output file without prompting
+    #[arg(long, conflicts_with = "no_overwrite")]
+    overwrite: bool,
+
+    /// Refuse to overwrite an existing output file (exit instead of prompting)
+    #[arg(long)]
+    no_overwrite: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -94,6 +102,42 @@ async fn resolve_host(host: &str, port: u16, mode: IpMode) -> Result<SocketAddr>
     };
 
     picked.with_context(|| format!("No {} address found for {}", mode.label(), host))
+}
+
+/// Interactive `[Y/n]` prompt asking whether to overwrite an existing file.
+/// Empty input is treated as Y. If stdin isn't a TTY (e.g. piped script),
+/// bail with a hint to use `--overwrite` / `--no-overwrite` explicitly,
+/// rather than silently overwriting or silently aborting.
+async fn confirm_overwrite(path: &Path) -> Result<bool> {
+    use std::io::IsTerminal;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "File '{}' already exists and stdin is not a TTY; \
+             pass --overwrite or --no-overwrite to make the choice explicit.",
+            path.display()
+        );
+    }
+
+    let mut stdout = tokio::io::stdout();
+    stdout
+        .write_all(
+            format!(
+                "File '{}' already exists. Overwrite? [Y/n] ",
+                path.display()
+            )
+            .as_bytes(),
+        )
+        .await?;
+    stdout.flush().await?;
+
+    let mut reader = BufReader::new(tokio::io::stdin());
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    let response = line.trim().to_ascii_lowercase();
+
+    Ok(response.is_empty() || response == "y" || response == "yes")
 }
 
 #[tokio::main]
@@ -160,6 +204,21 @@ async fn main() -> Result<()> {
     );
     if args.aggressive {
         println!("Supervisor: aggressive mode");
+    }
+
+    // ─── Existing-file handling ──────────────────────────────────────
+    if filename.exists() {
+        let proceed = if args.overwrite {
+            true
+        } else if args.no_overwrite {
+            false
+        } else {
+            confirm_overwrite(&filename).await?
+        };
+        if !proceed {
+            println!("Aborted: '{}' already exists.", filename.display());
+            return Ok(());
+        }
     }
 
     // Pre-allocate
@@ -385,8 +444,7 @@ async fn main() -> Result<()> {
 
                     pb.inc(len);
 
-                    let total_snapshot =
-                        total_bytes_arc.fetch_add(len, Ordering::Relaxed) + len;
+                    let total_snapshot = total_bytes_arc.fetch_add(len, Ordering::Relaxed) + len;
                     main_pb_clone.set_position(total_snapshot);
 
                     let now = Instant::now();
@@ -499,8 +557,7 @@ async fn main() -> Result<()> {
         // Per-chunk (last_observed_position, last_observed_time) used by the
         // hung-connection detector. Lazy-initialised the first time we see
         // each chunk active.
-        let mut last_progress: Vec<Option<(u64, Instant)>> =
-            vec![None; supervisor_speeds.len()];
+        let mut last_progress: Vec<Option<(u64, Instant)>> = vec![None; supervisor_speeds.len()];
         loop {
             tick.tick().await;
 
