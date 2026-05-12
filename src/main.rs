@@ -42,37 +42,21 @@ async fn main() -> Result<()> {
         .pool_idle_timeout(Duration::from_secs(30))
         .build()?;
 
-    // ─── HEAD ────────────────────────────────────────────────────────
-    let head = client.head(url.as_str()).send().await?;
-    if !head.status().is_success() {
-        bail!(
-            "HEAD failed: {} {}",
-            head.status(),
-            head.text().await.unwrap_or_default()
-        );
-    }
-
-    let content_length = head
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .context("No Content-Length → cannot use multi-connection")?;
-
-    let accept_ranges = head
-        .headers()
-        .get(header::ACCEPT_RANGES)
-        .and_then(|v| v.to_str().ok())
-        .map_or(false, |v| v.contains("bytes"));
+    // ─── Metadata probe ──────────────────────────────────────────────
+    // Try HEAD first; fall back to a ranged GET if HEAD fails.
+    // (Signed URLs — e.g. S3 presigned GETs — are bound to a single method
+    // and return 401/403 on HEAD even though GET works fine. wget never
+    // uses HEAD, which is why it succeeds where a HEAD-only client doesn't.)
+    let (content_length, accept_ranges, content_disposition) =
+        probe_metadata(&client, url.as_str()).await?;
 
     if !accept_ranges && args.connections > 1 {
         eprintln!("Warning: Server does not advertise range support → using single connection");
     }
 
     let filename = args.output.unwrap_or_else(|| {
-        head.headers()
-            .get(header::CONTENT_DISPOSITION)
-            .and_then(|v| v.to_str().ok())
+        content_disposition
+            .as_deref()
             .and_then(parse_content_disposition_filename)
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -294,6 +278,87 @@ async fn main() -> Result<()> {
     println!("SHA-256:           {}", hash_hex);
 
     Ok(())
+}
+
+/// Probe a URL for `(content_length, accept_ranges, content_disposition)`.
+///
+/// Tries HEAD first, then falls back to a `Range: bytes=0-0` GET if HEAD
+/// returns a non-success status. The fallback handles signed URLs that
+/// are bound to GET (e.g. S3 presigned URLs) and servers that don't
+/// implement HEAD at all.
+async fn probe_metadata(
+    client: &Client,
+    url: &str,
+) -> Result<(u64, bool, Option<String>)> {
+    let head = client.head(url).send().await?;
+
+    if head.status().is_success() {
+        let cl = head
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .context("No Content-Length → cannot use multi-connection")?;
+        let ar = head
+            .headers()
+            .get(header::ACCEPT_RANGES)
+            .and_then(|v| v.to_str().ok())
+            .map_or(false, |v| v.contains("bytes"));
+        let cd = head
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        return Ok((cl, ar, cd));
+    }
+
+    eprintln!(
+        "HEAD returned {} → falling back to ranged GET probe",
+        head.status()
+    );
+    drop(head);
+
+    let probe = client
+        .get(url)
+        .header(header::RANGE, "bytes=0-0")
+        .send()
+        .await?;
+
+    if !probe.status().is_success() {
+        bail!(
+            "Probe failed: {} {}",
+            probe.status(),
+            probe.text().await.unwrap_or_default()
+        );
+    }
+
+    let cd = probe
+        .headers()
+        .get(header::CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
+    if probe.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        // 206: ranges supported. Total size lives in `Content-Range: bytes 0-0/<total>`.
+        let total = probe
+            .headers()
+            .get(header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit('/').next().map(str::trim))
+            .filter(|v| *v != "*")
+            .and_then(|v| v.parse::<u64>().ok())
+            .context("Probe returned 206 without parseable Content-Range total")?;
+        Ok((total, true, cd))
+    } else {
+        // 200: server ignored Range. Single-connection only.
+        let total = probe
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .context("No Content-Length → cannot use multi-connection")?;
+        Ok((total, false, cd))
+    }
 }
 
 fn parse_content_disposition_filename(cd: &str) -> Option<String> {
