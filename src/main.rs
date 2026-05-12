@@ -2,11 +2,13 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::{header, Client};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::net::lookup_host;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use url::Url;
@@ -28,6 +30,59 @@ struct Args {
     /// Minimum chunk size per connection (bytes)
     #[arg(long, default_value_t = 1_048_576)] // 1 MiB
     min_chunk: u64,
+
+    /// Force IPv4 (like ping -4)
+    #[arg(short = '4', long = "ipv4", conflicts_with = "ipv6")]
+    ipv4: bool,
+
+    /// Force IPv6 (like ping -6)
+    #[arg(short = '6', long = "ipv6")]
+    ipv6: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum IpMode {
+    Auto,
+    V4,
+    V6,
+}
+
+impl IpMode {
+    fn from_args(ipv4: bool, ipv6: bool) -> Self {
+        match (ipv4, ipv6) {
+            (true, false) => IpMode::V4,
+            (false, true) => IpMode::V6,
+            _ => IpMode::Auto,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            IpMode::Auto => "auto",
+            IpMode::V4 => "IPv4",
+            IpMode::V6 => "IPv6",
+        }
+    }
+}
+
+/// Resolve `host:port` honoring the IPv4/IPv6 preference.
+async fn resolve_host(host: &str, port: u16, mode: IpMode) -> Result<SocketAddr> {
+    let addrs: Vec<SocketAddr> = lookup_host((host, port))
+        .await
+        .with_context(|| format!("Failed to resolve {}", host))?
+        .collect();
+
+    if addrs.is_empty() {
+        bail!("No addresses returned for {}", host);
+    }
+
+    let picked = match mode {
+        IpMode::Auto => addrs.first().copied(),
+        IpMode::V4 => addrs.iter().find(|a| a.is_ipv4()).copied(),
+        IpMode::V6 => addrs.iter().find(|a| a.is_ipv6()).copied(),
+    };
+
+    picked.with_context(|| format!("No {} address found for {}", mode.label(), host))
 }
 
 #[tokio::main]
@@ -37,9 +92,22 @@ async fn main() -> Result<()> {
     let start_time = Instant::now();
 
     let url = Url::parse(&args.url).context("Invalid URL")?;
+    let ip_mode = IpMode::from_args(args.ipv4, args.ipv6);
+
+    // ─── Resolve hostname honoring -4 / -6 ──────────────────────────
+    let host = url
+        .host_str()
+        .context("URL has no host to resolve")?
+        .to_string();
+    let port = url
+        .port_or_known_default()
+        .context("URL has no port and no known default for its scheme")?;
+    let resolved = resolve_host(&host, port, ip_mode).await?;
+
     let client = Client::builder()
         .user_agent("rget/0.1 (multi-connection downloader)")
         .pool_idle_timeout(Duration::from_secs(30))
+        .resolve(&host, resolved)
         .build()?;
 
     // ─── Metadata probe ──────────────────────────────────────────────
@@ -69,6 +137,12 @@ async fn main() -> Result<()> {
     });
 
     println!("Downloading {} → {}", url, filename.display());
+    println!(
+        "Resolved {} → {} ({})",
+        host,
+        resolved.ip(),
+        ip_mode.label()
+    );
     println!(
         "Size: {} bytes | Connections: {}",
         content_length, args.connections
