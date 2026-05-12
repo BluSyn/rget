@@ -4,6 +4,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::{header, Client};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs::{self, OpenOptions};
@@ -177,6 +178,18 @@ async fn main() -> Result<()> {
         .unwrap()
         .progress_chars("=>-");
 
+    // Style applied to whichever chunk is currently the slowest.
+    let chunk_style_slow = ProgressStyle::default_bar()
+        .template("{spinner:.red} [{elapsed_precise}] [{wide_bar:.red}] {bytes}/{total_bytes} ({bytes_per_sec})")
+        .unwrap()
+        .progress_chars("=>-");
+
+    // Style applied to chunks once they have finished downloading.
+    let chunk_style_done = ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.green}] {bytes}/{total_bytes} ({bytes_per_sec})")
+        .unwrap()
+        .progress_chars("=>-");
+
     // Shared state for total speed calculation
     let total_bytes_downloaded = Arc::new(Mutex::new(0u64));
     let total_last_bytes = Arc::new(Mutex::new(0u64));
@@ -201,22 +214,43 @@ async fn main() -> Result<()> {
     let mut tasks = Vec::new();
     let path_clone = filename.clone();
 
+    // Per-chunk shared state for the "slowest chunk" supervisor.
+    struct ChunkSpeed {
+        started: AtomicBool,
+        done: AtomicBool,
+    }
+    let chunk_count = chunks.len();
+    let chunk_speeds: Vec<Arc<ChunkSpeed>> = (0..chunk_count)
+        .map(|_| {
+            Arc::new(ChunkSpeed {
+                started: AtomicBool::new(false),
+                done: AtomicBool::new(false),
+            })
+        })
+        .collect();
+    let mut chunk_pbs: Vec<ProgressBar> = Vec::with_capacity(chunk_count);
+
     for (i, (range_start, range_end)) in chunks.into_iter().enumerate() {
         let pb = mp.insert(i + 1, ProgressBar::new(range_end - range_start + 1));
         pb.set_style(chunk_style.clone());
         pb.set_prefix(format!("Chunk {:2} ", i + 1));
+        chunk_pbs.push(pb.clone());
 
         let main_pb_clone = main_pb.clone();
         let total_bytes_arc = total_bytes_downloaded.clone();
         let total_last_bytes_arc = total_last_bytes.clone();
         let total_last_time_arc = total_last_time.clone();
+        let chunk_speed = chunk_speeds[i].clone();
 
         let client = client.clone();
         let url_str = url.to_string();
         let range_header = format!("bytes={}-{}", range_start, range_end);
         let path_for_task = path_clone.clone();
+        let done_style = chunk_style_done.clone();
 
         tasks.push(tokio::spawn(async move {
+            chunk_speed.started.store(true, Ordering::Relaxed);
+
             let mut resp = client
                 .get(&url_str)
                 .header(header::RANGE, &range_header)
@@ -258,7 +292,7 @@ async fn main() -> Result<()> {
                     *total
                 };
 
-                // Update total speed ~every 400ms
+                // Update chunk speed ~every 400ms
                 let now = Instant::now();
                 if now.duration_since(last_time) >= Duration::from_millis(400) {
                     let delta_bytes = chunk_bytes.saturating_sub(last_bytes);
@@ -279,12 +313,8 @@ async fn main() -> Result<()> {
 
                     let delta_t = now.duration_since(*last_total_time).as_secs_f64();
                     if delta_t >= 0.4 {
-                        // saturating_sub avoids underflow in the unlikely case
-                        // last_total_bytes was set ahead of our snapshot by
-                        // another task between the two locked sections.
                         let delta_total = total_snapshot.saturating_sub(*last_total_bytes);
-                        let total_speed =
-                            (delta_total as f64) / delta_t.max(0.001) / 1_048_576.0;
+                        let total_speed = (delta_total as f64) / delta_t.max(0.001) / 1_048_576.0;
                         main_pb_clone.set_message(format!("{:.1} MiB/s", total_speed));
 
                         *last_total_bytes = total_snapshot;
@@ -293,15 +323,89 @@ async fn main() -> Result<()> {
                 }
             }
 
+            chunk_speed.done.store(true, Ordering::Relaxed);
+            pb.set_style(done_style);
             pb.finish_with_message("✓");
             Ok::<_, anyhow::Error>(())
         }));
     }
 
+    // ─── "Slowest chunk" supervisor ─────────────────────────────────
+    // Periodically inspects every active chunk's completion percentage
+    // and applies a red style to whichever is furthest behind. We wait
+    // until overall download has crossed a threshold before highlighting,
+    // since chunks can start at slightly different times and very-early
+    // percentages are meaningless. Highlighting the chunk with the lowest
+    // completion is relatively stable, reducing flickering.
+    const HIGHLIGHT_AFTER_FRACTION: f64 = 0.10;
+    let supervisor_speeds = chunk_speeds.clone();
+    let supervisor_pbs = chunk_pbs.clone();
+    let supervisor_total = total_bytes_downloaded.clone();
+    let normal_style = chunk_style.clone();
+    let slow_style = chunk_style_slow.clone();
+    let supervisor = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(500));
+        tick.tick().await; // discard the immediate first tick
+        let mut current_slow: Vec<bool> = vec![false; supervisor_speeds.len()];
+        loop {
+            tick.tick().await;
+
+            // Don't highlight anything until we're past the warm-up phase.
+            let total_so_far = *supervisor_total.lock().await;
+            let overall_fraction = total_so_far as f64 / content_length as f64;
+
+            let mut want_slow = vec![false; supervisor_speeds.len()];
+
+            if overall_fraction >= HIGHLIGHT_AFTER_FRACTION {
+                // Collect (index, completion_fraction) for chunks that are
+                // running (started but not finished).
+                let mut active: Vec<(usize, f64)> = supervisor_speeds
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| {
+                        if !s.started.load(Ordering::Relaxed) || s.done.load(Ordering::Relaxed) {
+                            return None;
+                        }
+                        let pb = &supervisor_pbs[i];
+                        let len = pb.length().unwrap_or(0);
+                        if len == 0 {
+                            return None;
+                        }
+                        let frac = pb.position() as f64 / len as f64;
+                        Some((i, frac))
+                    })
+                    .collect();
+
+                // Need at least 2 active chunks for "slowest" to be meaningful.
+                if active.len() >= 2 {
+                    active
+                        .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                    want_slow[active[0].0] = true;
+                }
+            }
+
+            for (i, pb) in supervisor_pbs.iter().enumerate() {
+                // Don't fight the task's own done-style assignment.
+                if supervisor_speeds[i].done.load(Ordering::Relaxed) {
+                    continue;
+                }
+                if want_slow[i] != current_slow[i] {
+                    pb.set_style(if want_slow[i] {
+                        slow_style.clone()
+                    } else {
+                        normal_style.clone()
+                    });
+                    current_slow[i] = want_slow[i];
+                }
+            }
+        }
+    });
+
     // Wait for all chunks
     for task in tasks {
         task.await??;
     }
+    supervisor.abort();
 
     // ─── Summary ─────────────────────────────────────────────────────
     let total_duration = start_time.elapsed();
@@ -362,10 +466,7 @@ async fn main() -> Result<()> {
 /// returns a non-success status. The fallback handles signed URLs that
 /// are bound to GET (e.g. S3 presigned URLs) and servers that don't
 /// implement HEAD at all.
-async fn probe_metadata(
-    client: &Client,
-    url: &str,
-) -> Result<(u64, bool, Option<String>)> {
+async fn probe_metadata(client: &Client, url: &str) -> Result<(u64, bool, Option<String>)> {
     let head = client.head(url).send().await?;
 
     if head.status().is_success() {
