@@ -271,11 +271,15 @@ async fn main() -> Result<()> {
     // `total_bytes_downloaded` is hit on every HTTP chunk callback by every
     // task, so it's an AtomicU64 (single fetch_add) instead of a Mutex.
     // `total_speed_state` holds the (last_sample_bytes, last_sample_time)
-    // pair used to compute the global MiB/s message; collapsing them into
-    // one std::sync::Mutex eliminates an extra async lock acquisition per
-    // chunk callback.
+    // pair used to compute the global MiB/s message.
+    // `total_sample_deadline_ms` is an atomic fast-path: every callback
+    // first compares its elapsed-ms-since-start against this value, and
+    // only acquires the speed-state mutex when a new sample is plausibly
+    // due (~every 400 ms), eliminating ~99% of the lock acquisitions that
+    // would otherwise happen at full chunk-callback rate.
     let total_bytes_downloaded = Arc::new(AtomicU64::new(0));
     let total_speed_state = Arc::new(Mutex::new((0u64, Instant::now())));
+    let total_sample_deadline_ms = Arc::new(AtomicU64::new(400));
 
     // ─── Chunking ───────────────────────────────────────────────────
     let effective_n = if accept_ranges {
@@ -346,6 +350,7 @@ async fn main() -> Result<()> {
         let main_pb_clone = main_pb.clone();
         let total_bytes_arc = total_bytes_downloaded.clone();
         let total_speed_state_arc = total_speed_state.clone();
+        let total_sample_deadline_ms_arc = total_sample_deadline_ms.clone();
         let chunk_speed = chunk_speeds[i].clone();
 
         let client = client.clone();
@@ -353,6 +358,7 @@ async fn main() -> Result<()> {
         let path_for_task = path_clone.clone();
         let done_style = chunk_style_done.clone();
         let restart_style = chunk_style_restart.clone();
+        let download_start = start_time;
 
         tasks.push(tokio::spawn(async move {
             chunk_speed.started.store(true, Ordering::Relaxed);
@@ -459,7 +465,11 @@ async fn main() -> Result<()> {
                         last_time = now;
                     }
 
-                    {
+                    // Global speed sample, gated by an atomic deadline so
+                    // we only take the speed-state lock once per ~400 ms
+                    // across all tasks instead of on every chunk callback.
+                    let elapsed_ms = now.duration_since(download_start).as_millis() as u64;
+                    if elapsed_ms >= total_sample_deadline_ms_arc.load(Ordering::Relaxed) {
                         let mut state = total_speed_state_arc
                             .lock()
                             .expect("total_speed_state mutex poisoned");
@@ -473,6 +483,7 @@ async fn main() -> Result<()> {
 
                             *last_total_bytes = total_snapshot;
                             *last_total_time = now;
+                            total_sample_deadline_ms_arc.store(elapsed_ms + 400, Ordering::Relaxed);
                         }
                     }
                 }
