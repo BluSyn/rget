@@ -39,6 +39,10 @@ struct Args {
     /// Force IPv6 (like ping -6)
     #[arg(short = '6', long = "ipv6")]
     ipv6: bool,
+
+    /// Skip the SHA-256 verification step after download
+    #[arg(long)]
+    no_sha256: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -572,6 +576,10 @@ async fn main() -> Result<()> {
     );
 
     // ─── SHA-256 with spinner ───────────────────────────────────────
+    if args.no_sha256 {
+        return Ok(());
+    }
+
     println!("Computing SHA-256...");
 
     let hash_spinner = ProgressBar::new_spinner();
