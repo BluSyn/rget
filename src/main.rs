@@ -303,6 +303,25 @@ async fn main() -> Result<()> {
                     anyhow::bail!("Range request failed: {}", resp.status());
                 }
 
+                // Guard against servers that ignore the Range header and
+                // send 200 OK with the entire file body. Writing that
+                // stream into our chunk's slot would corrupt the output.
+                // 200 is only acceptable when we're effectively asking for
+                // the whole file from byte 0 (i.e., single-connection mode
+                // with no resume), in which case the body matches what we
+                // want anyway.
+                let expecting_partial = abs_start > 0 || range_end < content_length - 1;
+                if expecting_partial && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+                    anyhow::bail!(
+                        "Server ignored Range header (got {} instead of 206 \
+                         Partial Content) for bytes={}-{}. Refusing to write \
+                         to avoid corrupting the output file.",
+                        resp.status(),
+                        abs_start,
+                        range_end
+                    );
+                }
+
                 // Reset speed-sample baseline at the start of each attempt
                 // so we don't show an artificial spike right after a restart.
                 let mut last_bytes = chunk_bytes;
@@ -420,12 +439,12 @@ async fn main() -> Result<()> {
     //   - At most 2 chunks still active (everyone else is done) AND
     //     at least 1 chunk has finished (the link demonstrably works), AND
     //   - Laggard's completion < 30%, AND
-    //   - The lag has been sustained for ≥15s (no transient stalls), AND
+    //   - The lag has been sustained for ≥10s (no transient stalls), AND
     //   - The chunk hasn't already been restarted, AND
     //   - We're not in the post-restart cooldown window.
     const HIGHLIGHT_AFTER_FRACTION: f64 = 0.10;
-    const RESTART_FRACTION_CEILING: f64 = 0.30;
-    const RESTART_SUSTAINED_SECS: u64 = 15;
+    const RESTART_FRACTION_CEILING: f64 = 0.50;
+    const RESTART_SUSTAINED_SECS: u64 = 10;
     let supervisor_speeds = chunk_speeds.clone();
     let supervisor_pbs = chunk_pbs.clone();
     let supervisor_total = total_bytes_downloaded.clone();
