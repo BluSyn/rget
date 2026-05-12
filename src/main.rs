@@ -1,17 +1,17 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reqwest::{header, Client};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::net::lookup_host;
 use tokio::process::Command;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Notify;
 use url::Url;
 
 #[derive(Parser)]
@@ -175,6 +175,10 @@ async fn main() -> Result<()> {
     }
 
     let mp = MultiProgress::new();
+    // Cap progress redraws at 10 Hz to reduce terminal flicker. The actual
+    // bar values keep updating at full rate; only the rendered output is
+    // throttled.
+    mp.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
 
     // ─── Main (total) progress bar ──────────────────────────────────
     let main_style = ProgressStyle::default_bar()
@@ -203,10 +207,16 @@ async fn main() -> Result<()> {
         .unwrap()
         .progress_chars("=>-");
 
-    // Shared state for total speed calculation
-    let total_bytes_downloaded = Arc::new(Mutex::new(0u64));
-    let total_last_bytes = Arc::new(Mutex::new(0u64));
-    let total_last_time = Arc::new(Mutex::new(Instant::now()));
+    // Shared state for total speed calculation.
+    //
+    // `total_bytes_downloaded` is hit on every HTTP chunk callback by every
+    // task, so it's an AtomicU64 (single fetch_add) instead of a Mutex.
+    // `total_speed_state` holds the (last_sample_bytes, last_sample_time)
+    // pair used to compute the global MiB/s message; collapsing them into
+    // one std::sync::Mutex eliminates an extra async lock acquisition per
+    // chunk callback.
+    let total_bytes_downloaded = Arc::new(AtomicU64::new(0));
+    let total_speed_state = Arc::new(Mutex::new((0u64, Instant::now())));
 
     // ─── Chunking ───────────────────────────────────────────────────
     let effective_n = if accept_ranges {
@@ -276,8 +286,7 @@ async fn main() -> Result<()> {
 
         let main_pb_clone = main_pb.clone();
         let total_bytes_arc = total_bytes_downloaded.clone();
-        let total_last_bytes_arc = total_last_bytes.clone();
-        let total_last_time_arc = total_last_time.clone();
+        let total_speed_state_arc = total_speed_state.clone();
         let chunk_speed = chunk_speeds[i].clone();
 
         let client = client.clone();
@@ -376,12 +385,9 @@ async fn main() -> Result<()> {
 
                     pb.inc(len);
 
-                    let total_snapshot = {
-                        let mut total = total_bytes_arc.lock().await;
-                        *total += len;
-                        main_pb_clone.set_position(*total);
-                        *total
-                    };
+                    let total_snapshot =
+                        total_bytes_arc.fetch_add(len, Ordering::Relaxed) + len;
+                    main_pb_clone.set_position(total_snapshot);
 
                     let now = Instant::now();
                     if now.duration_since(last_time) >= Duration::from_millis(400) {
@@ -396,9 +402,10 @@ async fn main() -> Result<()> {
                     }
 
                     {
-                        let mut last_total_bytes = total_last_bytes_arc.lock().await;
-                        let mut last_total_time = total_last_time_arc.lock().await;
-
+                        let mut state = total_speed_state_arc
+                            .lock()
+                            .expect("total_speed_state mutex poisoned");
+                        let (last_total_bytes, last_total_time) = &mut *state;
                         let delta_t = now.duration_since(*last_total_time).as_secs_f64();
                         if delta_t >= 0.4 {
                             let delta_total = total_snapshot.saturating_sub(*last_total_bytes);
@@ -417,8 +424,14 @@ async fn main() -> Result<()> {
                     // for the next attempt.
                     drop(resp);
                     chunk_speed.restart_count.fetch_add(1, Ordering::Relaxed);
-                    *chunk_speed.lagging_since.lock().await = None;
-                    *chunk_speed.cooldown_until.lock().await =
+                    *chunk_speed
+                        .lagging_since
+                        .lock()
+                        .expect("lagging_since mutex poisoned") = None;
+                    *chunk_speed
+                        .cooldown_until
+                        .lock()
+                        .expect("cooldown_until mutex poisoned") =
                         Some(Instant::now() + Duration::from_secs(15));
 
                     pb.set_style(restart_style.clone());
@@ -479,7 +492,7 @@ async fn main() -> Result<()> {
         loop {
             tick.tick().await;
 
-            let total_so_far = *supervisor_total.lock().await;
+            let total_so_far = supervisor_total.load(Ordering::Relaxed);
             let overall_fraction = total_so_far as f64 / content_length as f64;
 
             // Build the active list once; reuse for both highlight + restart.
@@ -520,7 +533,7 @@ async fn main() -> Result<()> {
                     && supervisor_speeds[i]
                         .cooldown_until
                         .lock()
-                        .await
+                        .expect("cooldown_until mutex poisoned")
                         .is_some_and(|t| Instant::now() < t)
                 {
                     continue;
@@ -557,7 +570,11 @@ async fn main() -> Result<()> {
             if state.restart_count.load(Ordering::Relaxed) >= 1 {
                 continue;
             }
-            if let Some(t) = *state.cooldown_until.lock().await {
+            if let Some(t) = *state
+                .cooldown_until
+                .lock()
+                .expect("cooldown_until mutex poisoned")
+            {
                 if Instant::now() < t {
                     continue;
                 }
@@ -571,14 +588,20 @@ async fn main() -> Result<()> {
             };
 
             if frac_ok {
-                let mut lag = state.lagging_since.lock().await;
+                let mut lag = state
+                    .lagging_since
+                    .lock()
+                    .expect("lagging_since mutex poisoned");
                 let since = lag.get_or_insert_with(Instant::now);
                 if Instant::now().duration_since(*since) >= Duration::from_secs(sustained_secs) {
                     drop(lag);
                     state.restart_notify.notify_one();
                 }
             } else {
-                *state.lagging_since.lock().await = None;
+                *state
+                    .lagging_since
+                    .lock()
+                    .expect("lagging_since mutex poisoned") = None;
             }
         }
     });
