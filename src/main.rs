@@ -43,6 +43,12 @@ struct Args {
     /// Skip the SHA-256 verification step after download
     #[arg(long)]
     no_sha256: bool,
+
+    /// Aggressive supervisor: once more than half of connections have
+    /// finished, restart any active connection still below 50% completion.
+    /// (Default supervisor only restarts when ≤2 connections remain active.)
+    #[arg(long)]
+    aggressive: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -152,6 +158,9 @@ async fn main() -> Result<()> {
         "Size: {} bytes | Connections: {}",
         content_length, args.connections
     );
+    if args.aggressive {
+        println!("Supervisor: aggressive mode");
+    }
 
     // Pre-allocate
     fs::create_dir_all(filename.parent().unwrap_or(Path::new("."))).await?;
@@ -439,16 +448,25 @@ async fn main() -> Result<()> {
     // the active chunk with the lowest completion is shown red. Stable
     // and flicker-free.
     //
-    // Restart: only fires under tight conditions to avoid wasted work.
+    // Restart conditions (default mode): only fires under tight conditions
+    // to avoid wasted work.
     //   - At most 2 chunks still active (everyone else is done) AND
     //     at least 1 chunk has finished (the link demonstrably works), AND
-    //   - Laggard's completion < 30%, AND
+    //   - Laggard's completion < 50%, AND
     //   - The lag has been sustained for ≥10s (no transient stalls), AND
     //   - The chunk hasn't already been restarted, AND
     //   - We're not in the post-restart cooldown window.
+    //
+    // Restart conditions (--aggressive mode):
+    //   - At least half of all chunks have finished, AND
+    //   - Laggard's completion < 50%, AND
+    //   - Lag sustained ≥5s, AND
+    //   - Same restart-count + cooldown guards as default.
     const HIGHLIGHT_AFTER_FRACTION: f64 = 0.10;
     const RESTART_FRACTION_CEILING: f64 = 0.50;
-    const RESTART_SUSTAINED_SECS: u64 = 10;
+    const RESTART_SUSTAINED_SECS_DEFAULT: u64 = 10;
+    const RESTART_SUSTAINED_SECS_AGGRESSIVE: u64 = 5;
+    let aggressive = args.aggressive;
     let supervisor_speeds = chunk_speeds.clone();
     let supervisor_pbs = chunk_pbs.clone();
     let supervisor_total = total_bytes_downloaded.clone();
@@ -518,10 +536,19 @@ async fn main() -> Result<()> {
             }
 
             // ── Restart trigger ─────────────────────────────────────
-            // Conditions: ≤2 active, ≥1 done, laggard < 30%, ≥5× behind
-            // next-slowest, lag sustained ≥15s, not already restarted,
-            // not in cooldown.
-            if active.len() > 2 || active.is_empty() || finished_count == 0 {
+            // Mode-specific gating: default requires the laggard to be
+            // nearly alone among active chunks; aggressive only requires
+            // a finished majority.
+            if active.is_empty() {
+                continue;
+            }
+            let chunk_count = supervisor_speeds.len();
+            let gate_ok = if aggressive {
+                finished_count >= chunk_count / 2
+            } else {
+                active.len() <= 2 && finished_count >= 1
+            };
+            if !gate_ok {
                 continue;
             }
             let (slowest_idx, slowest_frac) = active[0];
@@ -537,13 +564,16 @@ async fn main() -> Result<()> {
             }
 
             let frac_ok = slowest_frac < RESTART_FRACTION_CEILING;
+            let sustained_secs = if aggressive {
+                RESTART_SUSTAINED_SECS_AGGRESSIVE
+            } else {
+                RESTART_SUSTAINED_SECS_DEFAULT
+            };
 
             if frac_ok {
                 let mut lag = state.lagging_since.lock().await;
                 let since = lag.get_or_insert_with(Instant::now);
-                if Instant::now().duration_since(*since)
-                    >= Duration::from_secs(RESTART_SUSTAINED_SECS)
-                {
+                if Instant::now().duration_since(*since) >= Duration::from_secs(sustained_secs) {
                     drop(lag);
                     state.restart_notify.notify_one();
                 }
