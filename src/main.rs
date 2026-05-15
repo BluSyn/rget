@@ -1,26 +1,37 @@
-use anyhow::{bail, Context, Result};
-use clap::Parser;
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use parking_lot::Mutex;
-use reqwest::{header, Client};
-use serde::{Deserialize, Serialize};
+// ======================================================================
+// Module declarations (must be at the very top, before any `use`)
+// ======================================================================
+mod hash;
+mod ranges;
+mod resume;
+mod speed;
+
+// === Standard library ===
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
-
-use governor::clock::DefaultClock;
-use governor::state::{InMemoryState, NotKeyed};
-use governor::{Quota, RateLimiter};
-use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+// === External crates ===
+use anyhow::{bail, Context, Result};
+use clap::Parser;
+use governor::clock::DefaultClock;
+use governor::state::{InMemoryState, NotKeyed};
+use governor::{Quota, RateLimiter};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use parking_lot::Mutex;
+use reqwest::{header, Client};
+
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::net::lookup_host;
-use tokio::process::Command;
 use tokio::sync::Notify;
 use url::Url;
+
+// === Internal modules (selective imports) ===
+use crate::hash::HashAlgorithm;
 
 #[derive(Parser)]
 #[command(name = "rget", about = "Simple fast multi-connection HTTP downloader")]
@@ -216,7 +227,7 @@ async fn main() -> Result<()> {
     // Expand any number ranges (e.g. model-{001..040}-of-00040.safetensors)
     let mut expanded_urls: Vec<String> = Vec::new();
     for raw in target_urls {
-        expanded_urls.extend(expand_ranges(&raw));
+        expanded_urls.extend(crate::ranges::expand_ranges(&raw));
     }
     let target_urls = expanded_urls;
 
@@ -227,7 +238,7 @@ async fn main() -> Result<()> {
     // Create global rate limiter if --limit-rate was provided
     let rate_limiter: Option<Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>> =
         if let Some(ref speed_str) = args.limit_rate {
-            let bytes_per_sec = parse_speed(speed_str)?;
+            let bytes_per_sec = crate::speed::parse_speed(speed_str)?;
             let quota = Quota::per_second(
                 NonZeroU32::new(bytes_per_sec.clamp(1, u32::MAX as u64) as u32)
                     .context("Invalid rate limit")?,
@@ -341,7 +352,11 @@ async fn download_one(
     let expected_hashes = if args.no_sha {
         Vec::new()
     } else {
-        collect_expected_hashes(&args, &filename)?
+        crate::hash::collect_expected_hashes(
+            args.sha256.as_deref(),
+            args.sha512.as_deref(),
+            &filename,
+        )?
     };
 
     // ─── Resume detection ────────────────────────────────────────────
@@ -1117,7 +1132,7 @@ async fn download_one(
         hash_spinner.enable_steady_tick(Duration::from_millis(120));
         hash_spinner.set_message("Hashing file...");
 
-        let hash_hex = compute_hash(HashAlgorithm::Sha256, &filename, &hash_spinner).await;
+        let hash_hex = crate::hash::compute_hash(HashAlgorithm::Sha256, &filename, &hash_spinner).await;
 
         hash_spinner.finish_and_clear();
         println!("SHA-256:           {}", hash_hex);
@@ -1138,7 +1153,7 @@ async fn download_one(
     let mut all_ok = true;
     for (algo, expected_hex) in &expected_hashes {
         hash_spinner.set_message(format!("Computing {}...", algo.name()));
-        let actual = compute_hash(*algo, &filename, &hash_spinner).await;
+        let actual = crate::hash::compute_hash(*algo, &filename, &hash_spinner).await;
 
         if actual == *expected_hex {
             println!("{}: {}  ✓", algo.name(), actual);
@@ -1281,443 +1296,28 @@ fn parse_content_disposition_filename(cd: &str) -> Option<String> {
 /// Falls back to a pure-Rust implementation (`sha2` crate) if no system hasher works.
 /// This makes the feature portable across Linux, macOS, Windows, and minimal containers.
 
-#[allow(clippy::empty_line_after_doc_comments)]
-/// Supported hash algorithms for verification.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HashAlgorithm {
-    Sha256,
-    Sha512,
-}
+// Hash types and functions have been moved to src/hash.rs
 
-impl HashAlgorithm {
-    fn name(&self) -> &'static str {
-        match self {
-            HashAlgorithm::Sha256 => "SHA-256",
-            HashAlgorithm::Sha512 => "SHA-512",
-        }
-    }
+// Old hash code removed — now lives in src/hash.rs
 
-    fn hex_len(&self) -> usize {
-        match self {
-            HashAlgorithm::Sha256 => 64,
-            HashAlgorithm::Sha512 => 128,
-        }
-    }
-
-    /// Return the list of external commands (and their args) to try, in order.
-    fn system_tool_candidates(&self) -> &'static [(&'static str, &'static [&'static str])] {
-        match self {
-            HashAlgorithm::Sha256 => &[
-                ("sha256sum", &[]),
-                ("shasum", &["-a", "256"]),
-                ("sha256", &[]),
-                ("openssl", &["dgst", "-sha256", "-r"]),
-            ],
-            HashAlgorithm::Sha512 => &[
-                ("sha512sum", &[]),
-                ("shasum", &["-a", "512"]),
-                ("sha512", &[]),
-                ("openssl", &["dgst", "-sha512", "-r"]),
-            ],
-        }
-    }
-}
-
-/// Try to find a sidecar hash file next to `filename` (e.g. `model.safetensors.sha256`).
-/// Returns the algorithm and the hex string if a plausible sidecar is found.
-fn find_sidecar_hash(filename: &Path) -> Option<(HashAlgorithm, String)> {
-    let parent = filename.parent().unwrap_or_else(|| Path::new("."));
-    let stem = filename.file_name()?.to_string_lossy();
-
-    for (ext, algo) in [
-        (".sha256", HashAlgorithm::Sha256),
-        (".sha512", HashAlgorithm::Sha512),
-    ] {
-        let candidate = parent.join(format!("{}{}", stem, ext));
-        if let Ok(content) = std::fs::read_to_string(&candidate) {
-            if let Some(hex) = parse_hash_from_sidecar(&content, algo.hex_len()) {
-                return Some((algo, hex));
-            }
-        }
-    }
-    None
-}
-
-fn parse_hash_from_sidecar(content: &str, expected_len: usize) -> Option<String> {
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        // Take the first whitespace-separated token that looks like the right length hex
-        if let Some(token) = line.split_whitespace().next() {
-            let token = token.trim_matches('*'); // some tools prefix with *
-            if token.len() == expected_len && token.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Some(token.to_ascii_lowercase());
-            }
-        }
-    }
-    None
-}
 
 /// Collect all hashes we are expected to verify (from CLI flags and sidecars).
 /// CLI flags take precedence over sidecars for the same algorithm.
-fn collect_expected_hashes(args: &Args, filename: &Path) -> Result<Vec<(HashAlgorithm, String)>> {
-    let mut expected: Vec<(HashAlgorithm, String)> = Vec::new();
+// collect_expected_hashes moved to src/hash.rs
 
-    // From CLI
-    if let Some(ref h) = args.sha256 {
-        let hex = normalize_hash_hex(h, HashAlgorithm::Sha256)?;
-        expected.push((HashAlgorithm::Sha256, hex));
-    }
-    if let Some(ref h) = args.sha512 {
-        let hex = normalize_hash_hex(h, HashAlgorithm::Sha512)?;
-        expected.push((HashAlgorithm::Sha512, hex));
-    }
 
-    // From sidecars (only if not already provided via CLI for that algo)
-    if let Some((algo, hex)) = find_sidecar_hash(filename) {
-        let already_have = expected.iter().any(|(a, _)| *a == algo);
-        if !already_have {
-            expected.push((algo, hex));
-        }
-    }
+// normalize_hash_hex moved to src/hash.rs
+// compute_hash and related functions have been moved to src/hash.rs
 
-    Ok(expected)
-}
-
-fn normalize_hash_hex(input: &str, algo: HashAlgorithm) -> Result<String> {
-    let cleaned: String = input.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-    if cleaned.len() != algo.hex_len() {
-        bail!(
-            "Invalid {} hash length: expected {} hex characters, got {}",
-            algo.name(),
-            algo.hex_len(),
-            cleaned.len()
-        );
-    }
-    Ok(cleaned.to_ascii_lowercase())
-}
-
-/// Compute the hash for the given algorithm, using fast system tools when available,
-/// falling back to pure Rust.
-async fn compute_hash(algo: HashAlgorithm, path: &Path, spinner: &ProgressBar) -> String {
-    let candidates = algo.system_tool_candidates();
-
-    for (cmd, args) in candidates {
-        spinner.set_message(format!("Trying {}...", cmd));
-        let mut full_args: Vec<&str> = args.to_vec();
-        full_args.push(path.to_str().unwrap_or(""));
-        if let Ok(output) = Command::new(cmd).args(&full_args).output().await {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(hex) = stdout.split_whitespace().next() {
-                    let cleaned: String = hex.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-                    if cleaned.len() == algo.hex_len() {
-                        return cleaned.to_ascii_lowercase();
-                    }
-                }
-            }
-        }
-    }
-
-    // Pure Rust fallback
-    spinner.set_message(format!(
-        "Using pure-Rust {} (slower on very large files)...",
-        algo.name()
-    ));
-
-    let path = path.to_owned();
-    let result = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
-        use sha2::Digest;
-        use std::fs::File;
-        use std::io::{BufReader, Read};
-
-        let file = File::open(&path)?;
-        let mut reader = BufReader::with_capacity(1024 * 1024, file);
-        let mut buf = [0u8; 64 * 1024];
-
-        match algo {
-            HashAlgorithm::Sha256 => {
-                let mut hasher = sha2::Sha256::new();
-                loop {
-                    let n = reader.read(&mut buf)?;
-                    if n == 0 {
-                        break;
-                    }
-                    hasher.update(&buf[..n]);
-                }
-                Ok(hex::encode(hasher.finalize()))
-            }
-            HashAlgorithm::Sha512 => {
-                let mut hasher = sha2::Sha512::new();
-                loop {
-                    let n = reader.read(&mut buf)?;
-                    if n == 0 {
-                        break;
-                    }
-                    hasher.update(&buf[..n]);
-                }
-                Ok(hex::encode(hasher.finalize()))
-            }
-        }
-    })
-    .await;
-
-    match result {
-        Ok(Ok(hex)) => hex,
-        Ok(Err(e)) => {
-            eprintln!("Rust {} failed: {}", algo.name(), e);
-            "error".to_string()
-        }
-        Err(e) => {
-            eprintln!("{} task panicked: {}", algo.name(), e);
-            "error".to_string()
-        }
-    }
-}
 
 // ============================================================================
 // Cross-run resume support (control file)
-// ============================================================================
+// Resume types are now in src/resume.rs
+use crate::resume::{
+    compute_already_written_for_range, load_resume_state, remove_resume_state, save_resume_state,
+    validate_resume_state, ChunkProgress, ResumeState, RESUME_STATE_VERSION,
+};
 
-/// Version of the resume control file format.
-const RESUME_STATE_VERSION: u32 = 1;
+// Resume helper functions have been moved to src/resume.rs
+// (control_path_for, load/save/remove/validate_resume_state, compute_already_written_for_range)
 
-/// Per-chunk progress stored in the control file.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct ChunkProgress {
-    /// Inclusive start byte offset of this chunk.
-    start: u64,
-    /// Inclusive end byte offset of this chunk.
-    end: u64,
-    /// How many bytes have been successfully written for this chunk so far.
-    written: u64,
-}
-
-/// Persistent state for resuming a download across `rget` invocations.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct ResumeState {
-    version: u32,
-    /// The original URL being downloaded.
-    url: String,
-    /// ETag returned by the server (if any). Very useful for detecting when
-    /// the remote file has changed.
-    etag: Option<String>,
-    content_length: u64,
-    /// Number of connections used when this state was created.
-    connections: usize,
-    min_chunk: u64,
-    /// Progress for each chunk. The order must match the chunking logic used.
-    chunks: Vec<ChunkProgress>,
-}
-
-/// Returns the path of the control file for a given download target.
-/// We use a hidden file next to the target: `.<name>.rget`
-fn control_path_for(target: &Path) -> PathBuf {
-    let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    let name = target.file_name().unwrap_or_default();
-    parent.join(format!(".{}.rget", name.to_string_lossy()))
-}
-
-/// Attempt to load and deserialize a resume control file.
-/// Returns `None` if the file does not exist or cannot be parsed.
-fn load_resume_state(target: &Path) -> Option<ResumeState> {
-    let control_path = control_path_for(target);
-    if !control_path.exists() {
-        return None;
-    }
-
-    match std::fs::read_to_string(&control_path) {
-        Ok(content) => match serde_json::from_str::<ResumeState>(&content) {
-            Ok(state) => {
-                if state.version == RESUME_STATE_VERSION {
-                    Some(state)
-                } else {
-                    // Future version or unknown format → ignore.
-                    None
-                }
-            }
-            Err(_) => {
-                // Corrupt or unreadable control file → treat as absent.
-                // We could log a warning, but for now we silently start fresh.
-                None
-            }
-        },
-        Err(_) => None,
-    }
-}
-
-/// Atomically write (or update) the resume control file next to the target.
-fn save_resume_state(state: &ResumeState, target: &Path) -> Result<()> {
-    let control_path = control_path_for(target);
-    let tmp_path = control_path.with_extension("rget.tmp");
-
-    let json = serde_json::to_string_pretty(state).context("Failed to serialize resume state")?;
-
-    // Write to a temporary file first for atomicity.
-    std::fs::write(&tmp_path, json).context("Failed to write temporary resume file")?;
-
-    // Best-effort fsync. We ignore errors because not all platforms/filesystems
-    // support it, and a failed fsync is not fatal for resume correctness.
-    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&tmp_path) {
-        let _ = file.sync_all();
-    }
-
-    // Atomic rename (this is the critical step).
-    std::fs::rename(&tmp_path, &control_path)
-        .context("Failed to atomically replace resume control file")?;
-
-    Ok(())
-}
-
-/// Remove the control file (called on successful completion).
-fn remove_resume_state(target: &Path) {
-    let control_path = control_path_for(target);
-    let _ = std::fs::remove_file(control_path);
-}
-
-/// Validate whether a loaded `ResumeState` is still usable for the current download.
-/// We require at minimum that the content_length matches.
-/// If the server provided an ETag during probing and we have one in the state,
-/// they should match (otherwise the remote file likely changed).
-fn validate_resume_state(state: &ResumeState, content_length: u64, etag: Option<&str>) -> bool {
-    if state.content_length != content_length {
-        return false;
-    }
-
-    if let (Some(stored_etag), Some(current_etag)) = (&state.etag, etag) {
-        if stored_etag != current_etag {
-            return false;
-        }
-    }
-
-    true
-}
-
-/// Parse a human-readable speed string (e.g. "50M", "2G", "500K", "1.5M/s")
-/// into bytes per second.
-fn parse_speed(input: &str) -> Result<u64> {
-    let s = input.trim().to_ascii_lowercase();
-    let s = s.strip_suffix("/s").unwrap_or(&s).to_string();
-
-    // Split number and unit
-    let (num_part, unit) = if let Some(pos) = s.find(|c: char| !c.is_ascii_digit() && c != '.') {
-        (&s[..pos], &s[pos..])
-    } else {
-        (s.as_str(), "")
-    };
-
-    let value: f64 = num_part.parse().context("Invalid number in --limit-rate")?;
-
-    let multiplier: u64 = match unit.trim_start_matches(|c: char| c == ' ' || c == 'b') {
-        "" | "b" => 1,
-        "k" | "kb" => 1024,
-        "m" | "mb" => 1024 * 1024,
-        "g" | "gb" => 1024 * 1024 * 1024,
-        other => bail!(
-            "Unknown unit '{}' in --limit-rate. Supported units: K, M, G (case insensitive)",
-            other
-        ),
-    };
-
-    let bytes_per_sec = (value * multiplier as f64) as u64;
-
-    if bytes_per_sec == 0 {
-        bail!("--limit-rate cannot be zero");
-    }
-
-    Ok(bytes_per_sec)
-}
-
-/// Expands range patterns in a URL, e.g.:
-/// `model-{001..040}-of-00040.safetensors` → 40 URLs with zero-padded numbers.
-/// `model-{1..5}-part-{01..03}.bin` → 5 × 3 = 15 combinations.
-///
-/// Supports multiple independent ranges (cartesian product).
-/// Zero-padding is determined by the number of digits in the **start** of each range.
-fn expand_ranges(raw: &str) -> Vec<String> {
-    // Match {digits..digits}, e.g. {001..040} or {1..100}
-    let re = Regex::new(r"\{(\d+)\.\.(\d+)\}").unwrap();
-
-    // Find all matches with their positions
-    let matches: Vec<_> = re.find_iter(raw).collect();
-
-    if matches.is_empty() {
-        return vec![raw.to_string()];
-    }
-
-    // For each match, compute the list of string replacements (with proper padding)
-    let mut replacements: Vec<Vec<String>> = Vec::new();
-
-    for m in &matches {
-        let caps = re.captures(m.as_str()).unwrap();
-        let start_str = caps.get(1).unwrap().as_str();
-        let end_str = caps.get(2).unwrap().as_str();
-
-        let start: u64 = start_str.parse().unwrap_or(0);
-        let end: u64 = end_str.parse().unwrap_or(0);
-
-        if start > end {
-            // Invalid range, just keep original
-            replacements.push(vec![m.as_str().to_string()]);
-            continue;
-        }
-
-        let width = start_str.len(); // zero-padding width from left side
-        let mut variants = Vec::new();
-
-        for n in start..=end {
-            let s = format!("{:0width$}", n, width = width);
-            variants.push(s);
-        }
-
-        replacements.push(variants);
-    }
-
-    // Generate all combinations using cartesian product
-    let mut results = vec![raw.to_string()];
-
-    for (i, repls) in replacements.iter().enumerate() {
-        let mut new_results = Vec::new();
-        let mat = &matches[i];
-
-        for base in &results {
-            for repl in repls {
-                let mut new_url = base.clone();
-                // Replace only the first occurrence of this specific match
-                // (in case the same pattern appears multiple times, though unlikely)
-                if let Some(pos) = new_url.find(mat.as_str()) {
-                    new_url.replace_range(pos..pos + mat.as_str().len(), repl);
-                }
-                new_results.push(new_url);
-            }
-        }
-        results = new_results;
-    }
-
-    results
-}
-
-/// Given an old `ResumeState`, compute how many bytes in the range `[range_start, range_end]`
-/// have already been written according to the previous progress.
-/// This allows resuming even if the user changes `-n` between runs.
-fn compute_already_written_for_range(state: &ResumeState, range_start: u64, range_end: u64) -> u64 {
-    let mut written = 0u64;
-
-    for cp in &state.chunks {
-        // Compute overlap between [cp.start, cp.end] and [range_start, range_end]
-        let overlap_start = range_start.max(cp.start);
-        let overlap_end = range_end.min(cp.end);
-
-        if overlap_start <= overlap_end {
-            // How much of this old chunk was written?
-            let already = cp.written.min(cp.end - cp.start + 1);
-            // How much of the overlap is covered by already-written bytes?
-            let covered = already.saturating_sub(overlap_start.saturating_sub(cp.start));
-            written += covered.min(overlap_end - overlap_start + 1);
-        }
-    }
-
-    written.min(range_end - range_start + 1)
-}
