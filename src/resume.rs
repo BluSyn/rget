@@ -7,10 +7,6 @@ use std::path::{Path, PathBuf};
 /// Version of the resume control file format.
 pub const RESUME_STATE_VERSION: u32 = 1;
 
-/// Maximum allowed content length in a resume state file.
-/// This should match or be lower than the value used in main.rs.
-const MAX_CONTENT_LENGTH: u64 = 2 * 1024 * 1024 * 1024 * 1024; // 2 TiB
-
 /// Per-chunk progress stored in the control file.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ChunkProgress {
@@ -167,7 +163,7 @@ mod tests {
             chunks: vec![],
         };
 
-        assert!(!validate_resume_state(&state, 10_000_000_000_000, None, MAX_CONTENT_LENGTH));
+        assert!(!validate_resume_state(&state, 10_000_000_000_000, None, 2 * 1024 * 1024 * 1024 * 1024));
     }
 
     #[test]
@@ -186,7 +182,7 @@ mod tests {
             }],
         };
 
-        assert!(!validate_resume_state(&state, 1000, None, MAX_CONTENT_LENGTH));
+        assert!(!validate_resume_state(&state, 1000, None, 2 * 1024 * 1024 * 1024 * 1024));
     }
 
     #[test]
@@ -204,7 +200,7 @@ mod tests {
             ],
         };
 
-        assert!(validate_resume_state(&state, 10_000_000, Some("\"abc123\""), MAX_CONTENT_LENGTH));
+        assert!(validate_resume_state(&state, 10_000_000, Some("\"abc123\""), 2 * 1024 * 1024 * 1024 * 1024));
     }
 
     #[test]
@@ -219,8 +215,12 @@ mod tests {
             chunks: vec![],
         };
 
-        // Should be invalid with default 2TiB? Wait, 50GB is fine. Let's test rejection with small limit
-        assert!(!validate_resume_state(&state, 50_000_000_000, None, 10_000_000_000)); // 10GB cap
-        assert!(validate_resume_state(&state, 50_000_000_000, None, 100_000_000_000)); // 100GB cap
+        // Simulate user passing --max-size 10G
+        let small_limit: u64 = 10 * 1024 * 1024 * 1024;
+        assert!(!validate_resume_state(&state, 50_000_000_000, None, small_limit));
+
+        // Simulate user passing --max-size 100G
+        let large_limit: u64 = 100 * 1024 * 1024 * 1024;
+        assert!(validate_resume_state(&state, 50_000_000_000, None, large_limit));
     }
 }

@@ -76,9 +76,9 @@ struct Args {
     #[arg(short = 'n', long, default_value_t = 8)]
     connections: usize,
 
-    /// Minimum chunk size per connection (bytes)
-    #[arg(long, default_value_t = 1_048_576)] // 1 MiB
-    min_chunk: u64,
+    /// Minimum chunk size per connection (e.g. 1M, 256K, 1048576)
+    #[arg(long, value_name = "SIZE", default_value = "1M")]
+    min_chunk: String,
 
     /// Force IPv4 (like ping -4)
     #[arg(short = '4', long = "ipv4", conflicts_with = "ipv6")]
@@ -281,6 +281,10 @@ async fn main() -> Result<()> {
     let max_content_length: u64 = crate::speed::parse_human_size(&args.max_size)
         .context("Invalid value for --max-size")?;
 
+    // Parse --min-chunk for consistency with --max-size and --limit-rate
+    let min_chunk_size: u64 = crate::speed::parse_human_size(&args.min_chunk)
+        .context("Invalid value for --min-chunk")?;
+
     let mut succeeded = 0usize;
     let mut failed = 0usize;
 
@@ -291,7 +295,7 @@ async fn main() -> Result<()> {
             println!("\n[{} / {}] {}", i + 1, total, url_str);
         }
 
-        match download_one(url_str, &args, disable_resume, rate_limiter.clone(), max_content_length).await {
+        match download_one(url_str, &args, disable_resume, rate_limiter.clone(), max_content_length, min_chunk_size).await {
             Ok(()) => {
                 succeeded += 1;
             }
@@ -335,6 +339,7 @@ async fn download_one(
     disable_resume: bool,
     rate_limiter: Option<Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>>,
     max_content_length: u64,
+    min_chunk_size: u64,
 ) -> Result<()> {
     let start_time = Instant::now();
 
@@ -582,7 +587,7 @@ async fn download_one(
     } else {
         1
     };
-    let chunk_size = (content_length / effective_n as u64).max(args.min_chunk);
+    let chunk_size = (content_length / effective_n as u64).max(min_chunk_size);
 
     let mut chunks = Vec::new();
     let mut start = 0u64;
@@ -938,6 +943,7 @@ async fn download_one(
     let supervisor_download_complete = download_complete.clone();
     let supervisor_disable_resume = disable_resume;
     let supervisor_content_length = content_length;
+    let supervisor_min_chunk = min_chunk_size;
     let supervisor = tokio::spawn(async move {
         // 800 ms tick reduces CPU wakeups vs 500 ms while still giving
         // sub-second detection latency for hung connections (the hung
@@ -988,7 +994,7 @@ async fn download_one(
                     etag: supervisor_etag.clone(),
                     content_length: supervisor_content_length,
                     connections: supervisor_speeds.len(),
-                    min_chunk: 0,
+                    min_chunk: supervisor_min_chunk,
                     chunks: progress,
                 };
 

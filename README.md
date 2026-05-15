@@ -53,7 +53,7 @@ rget [OPTIONS] <URL>
 | --- | --- |
 | `-o, --output <FILE>` | Output file path. Default: inferred from `Content-Disposition` then URL path, falling back to `download.bin`. |
 | `-n, --connections <N>` | Number of parallel connections. Default: `8`. |
-| `--min-chunk <BYTES>` | Minimum chunk size per connection, in bytes. Default: `1048576` (1 MiB). |
+| `--min-chunk <SIZE>` | Minimum chunk size per connection (e.g. 1M, 256K, 1048576). Default: 1M. |
 | `-4, --ipv4` | Force IPv4 for the connection (analogous to `ping -4`). Mutually exclusive with `-6`. |
 | `-6, --ipv6` | Force IPv6 for the connection (analogous to `ping -6`). |
 | `--aggressive` | Aggressive supervisor mode: once more than half of the connections have finished, restart any active connection still below 50 % completion. The default supervisor only restarts a chunk when at most 2 connections remain active. |
