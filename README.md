@@ -9,10 +9,12 @@ A fast, multi-connection HTTP file downloader written in Rust. Designed to fully
 - The slowest active chunk is highlighted in red so you can see at a glance which connection is dragging the download down; finished chunks turn green
 - Supervisor that detects and restarts hung or persistently-lagging connections (capped at one restart per chunk to avoid loops)
 - Optional aggressive supervisor mode for more eager restarts once a finished majority is reached
-- Automatic resume of cancelled chunks via HTTP `Range` (no re-downloading already-written bytes)
+- Cross-run resume support using hidden control files (`.filename.rget`) — automatically continues interrupted downloads across runs
+- Automatic resume of cancelled chunks via HTTP `Range` (intra-run)
 - Strict 206-Partial-Content checking so a server that ignores `Range` and returns the full body can never silently corrupt the output
 - IPv4 / IPv6 forcing flags
-- Optional SHA-256 verification at the end (via system `sha256sum`)
+- SHA-256 / SHA-512 verification (CLI flags or automatic sidecar `.sha256`/`.sha512` files)
+- Cross-run resume support using hidden control files (`.filename.rget`)
 - Interactive overwrite prompt by default, with explicit `--overwrite` / `--no-overwrite` flags for non-interactive use
 - HEAD-then-ranged-GET probe so signed URLs (e.g. S3 presigned GETs) work without an extra round trip
 
@@ -54,7 +56,10 @@ rget [OPTIONS] <URL>
 | `--aggressive` | Aggressive supervisor mode: once more than half of the connections have finished, restart any active connection still below 50 % completion. The default supervisor only restarts a chunk when at most 2 connections remain active. |
 | `--overwrite` | Overwrite an existing output file without prompting. Mutually exclusive with `--no-overwrite`. |
 | `--no-overwrite` | Refuse to overwrite an existing output file (exit cleanly instead of prompting). |
-| `--no-sha256` | Skip the SHA-256 verification step after the download completes. |
+| `--sha256 <HEX>` | Verify the download against the given SHA-256 checksum. Fails the run on mismatch. Sidecar files (`<file>.sha256`) are detected automatically. |
+| `--sha512 <HEX>` | Verify the download against the given SHA-512 checksum. Fails the run on mismatch. Sidecar files (`<file>.sha512`) are detected automatically. |
+| `--no-sha` | Skip all checksum computation and verification for this run. |
+| `--no-continue` | Disable cross-run resume support entirely. No resume control file will be read or written. |
 | `-h, --help` | Print help. |
 
 If neither `--overwrite` nor `--no-overwrite` is set and the output file already exists, `rget` will prompt `Overwrite? [Y/n]` on a TTY. Running with a non-TTY stdin (e.g. from a script) without one of those flags is an error rather than a silent default, so you don't accidentally clobber files in CI.
@@ -73,10 +78,10 @@ rget https://example.com/large-file.zip
 rget -n 16 -4 -o ./out/large-file.zip https://example.com/large-file.zip
 ```
 
-Aggressive supervisor and skip the SHA-256 step (useful for very large files where the verification doubles the wall-clock time):
+Aggressive supervisor and skip checksum verification (useful for very large files where the verification doubles the wall-clock time):
 
 ```bash
-rget --aggressive --no-sha256 -n 16 https://example.com/model.safetensors
+rget --aggressive --no-sha -n 16 https://example.com/model.safetensors
 ```
 
 Scripted download, overwrite without prompting:
@@ -94,6 +99,33 @@ A separate "supervisor" task wakes every 500 ms and inspects each active chunk's
 - **Lagging chunk in `--aggressive` mode**: at least half of all connections have finished, the laggard is below 50 % completion, and the lag has been sustained for at least 5 s.
 
 In every case a chunk may only be restarted once. After a restart there is a 15 s cooldown before the chunk can be re-evaluated. These guarantees prevent the supervisor from getting stuck in a restart loop on a fundamentally slow link.
+
+## Cross-run Resume Support
+
+`rget` supports resuming downloads across multiple invocations using hidden control files (e.g. `.model.safetensors.rget` next to the target).
+
+When you interrupt a download (Ctrl+C, kill, crash, etc.), `rget` periodically saves progress to the control file. On the next run with the same command (and same output filename), it will automatically detect the partial file and resume from where it left off — even if you change the number of connections (`-n`).
+
+### Controlling Resume Behavior
+
+| Flag | Behavior |
+|------|----------|
+| (default) | Automatically resume if a valid control file exists |
+| `--no-continue` | Disable resume completely for this run. No control file will be read or written |
+| `--overwrite` | Force a fresh download (deletes any existing control file and truncates the target) |
+
+Example:
+
+```bash
+# First run (gets interrupted)
+rget -n 8 https://example.com/huge-model.safetensors
+
+# Later — automatically resumes
+rget -n 8 https://example.com/huge-model.safetensors
+
+# Start over completely
+rget --overwrite -n 8 https://example.com/huge-model.safetensors
+```
 
 ## License
 

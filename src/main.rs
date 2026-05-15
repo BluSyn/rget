@@ -3,6 +3,7 @@ use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use parking_lot::Mutex;
 use reqwest::{header, Client};
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -59,6 +60,11 @@ struct Args {
     /// Refuse to overwrite an existing output file (exit instead of prompting)
     #[arg(long)]
     no_overwrite: bool,
+
+    /// Disable resume support entirely for this run. No resume control file
+    /// will be read from or written to, regardless of whether one exists.
+    #[arg(long = "no-continue")]
+    no_continue: bool,
 
     /// Expected SHA-256 checksum (hex). If provided, the download is verified
     /// and the process exits with an error on mismatch.
@@ -157,6 +163,10 @@ async fn confirm_overwrite(path: &Path) -> Result<bool> {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
+    // When true, we completely bypass all resume logic (no reading or writing
+    // of .rget control files).
+    let disable_resume = args.no_continue;
+
     let start_time = Instant::now();
 
     let url = Url::parse(&args.url).context("Invalid URL")?;
@@ -183,7 +193,7 @@ async fn main() -> Result<()> {
     // (Signed URLs — e.g. S3 presigned GETs — are bound to a single method
     // and return 401/403 on HEAD even though GET works fine. wget never
     // uses HEAD, which is why it succeeds where a HEAD-only client doesn't.)
-    let (content_length, accept_ranges, content_disposition) =
+    let (content_length, accept_ranges, content_disposition, server_etag) =
         probe_metadata(&client, url.as_str()).await?;
 
     if !accept_ranges && args.connections > 1 {
@@ -212,6 +222,41 @@ async fn main() -> Result<()> {
         collect_expected_hashes(&args, &filename)?
     };
 
+    // ─── Resume detection ────────────────────────────────────────────
+    // Try to find a previous partial download for this exact target file.
+    // When --no-continue is used, we skip this entirely.
+    let resume_state = if disable_resume {
+        None
+    } else {
+        load_resume_state(&filename)
+    };
+
+    let mut resuming = false;
+
+    if let Some(state) = &resume_state {
+        if !disable_resume && validate_resume_state(state, content_length, server_etag.as_deref()) {
+            if filename.exists() {
+                resuming = true;
+                let already = state.chunks.iter().map(|c| c.written).sum::<u64>();
+                println!(
+                    "Resuming partial download ({:.1}% already done)...",
+                    100.0 * already as f64 / content_length as f64
+                );
+            } else {
+                // Control file exists but the target file was deleted.
+                // Treat as stale and start fresh.
+                remove_resume_state(&filename);
+            }
+        } else if disable_resume {
+            // User explicitly disabled resume — leave any existing control file alone.
+        }
+    }
+
+    if resuming && filename.exists() {
+        // Sanity check: the file should already be the right size from previous run.
+        // We do not truncate it.
+    }
+
     println!("Downloading {} → {}", url, filename.display());
     println!(
         "Resolved {} → {} ({})",
@@ -227,30 +272,56 @@ async fn main() -> Result<()> {
         println!("Supervisor: aggressive mode");
     }
 
-    // ─── Existing-file handling ──────────────────────────────────────
+    // ─── Existing-file handling (resume-aware) ──────────────────────
     if filename.exists() {
-        let proceed = if args.overwrite {
-            true
-        } else if args.no_overwrite {
-            false
+        if resuming {
+            // We have a valid resume control file for this download.
+            // The target file is *expected* to exist and be partially written.
+            // By default we continue the download without prompting.
+
+            if args.no_overwrite {
+                println!("Aborted: '{}' already exists.", filename.display());
+                return Ok(());
+            }
+
+            // If the user explicitly passed --overwrite while a resume state
+            // exists, treat it as "start over from scratch".
+            if args.overwrite {
+                remove_resume_state(&filename);
+                resuming = false;
+                // Because we set `resuming = false`, the chunking section below
+                // will compute `initial_chunk_bytes` as all zeros (fresh start).
+            }
         } else {
-            confirm_overwrite(&filename).await?
-        };
-        if !proceed {
-            println!("Aborted: '{}' already exists.", filename.display());
-            return Ok(());
+            // Not resuming (no valid control file, or --no-continue disabled resume).
+            let proceed = if args.overwrite {
+                true
+            } else if args.no_overwrite {
+                false
+            } else {
+                confirm_overwrite(&filename).await?
+            };
+            if !proceed {
+                println!("Aborted: '{}' already exists.", filename.display());
+                return Ok(());
+            }
         }
     }
 
-    // Pre-allocate
+    // Pre-allocate (or open for resume)
     fs::create_dir_all(filename.parent().unwrap_or(Path::new("."))).await?;
     {
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&filename)
-            .await?;
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true);
+
+        if resuming {
+            // Do not truncate an existing partial file when resuming.
+            opts.truncate(false);
+        } else {
+            opts.truncate(true);
+        }
+
+        let file = opts.open(&filename).await?;
         file.set_len(content_length).await?;
     }
 
@@ -331,6 +402,34 @@ async fn main() -> Result<()> {
         start = end + 1;
     }
 
+    // Keep the chunk ranges around for periodic resume state saving in the supervisor.
+    let chunk_ranges: Arc<Vec<(u64, u64)>> = Arc::new(chunks.clone());
+
+    // When resuming, map previous progress onto the (possibly different) chunk layout.
+    let initial_chunk_bytes: Vec<u64> = if resuming {
+        if let Some(state) = &resume_state {
+            chunks
+                .iter()
+                .map(|&(range_start, range_end)| {
+                    compute_already_written_for_range(state, range_start, range_end)
+                })
+                .collect()
+        } else {
+            vec![0u64; chunks.len()]
+        }
+    } else {
+        vec![0u64; chunks.len()]
+    };
+
+    // Seed global progress counters from resume state (so main progress bar and
+    // speed calculations start from the correct position).
+    let initial_total: u64 = initial_chunk_bytes.iter().sum();
+    total_bytes_downloaded.store(initial_total, Ordering::Relaxed);
+
+    if initial_total > 0 {
+        main_pb.set_position(initial_total);
+    }
+
     let mut tasks = Vec::new();
     let path_clone = filename.clone();
 
@@ -364,6 +463,20 @@ async fn main() -> Result<()> {
             })
         })
         .collect();
+
+    // Shared atomic counters for how many bytes have been written per chunk.
+    // Used both for progress reporting and for periodically persisting the
+    // resume control file.
+    let chunk_written: Vec<Arc<AtomicU64>> = (0..chunk_count)
+        .map(|_| Arc::new(AtomicU64::new(0)))
+        .collect();
+
+    // Seed the written counters from previous resume state (if any).
+    for (i, w) in initial_chunk_bytes.iter().enumerate() {
+        if i < chunk_written.len() {
+            chunk_written[i].store(*w, Ordering::Relaxed);
+        }
+    }
     let mut chunk_pbs: Vec<ProgressBar> = Vec::with_capacity(chunk_count);
 
     // Style applied briefly when a chunk is being restarted.
@@ -375,11 +488,37 @@ async fn main() -> Result<()> {
     // Hard cap on attempts per chunk: 1 initial + 1 restart.
     const MAX_ATTEMPTS: usize = 2;
 
-    for (i, (range_start, range_end)) in chunks.into_iter().enumerate() {
+    // Zip the chunk ranges with their (possibly non-zero) starting offset when resuming.
+    let chunk_iter = chunks.into_iter().zip(initial_chunk_bytes.into_iter());
+
+    for (i, ((range_start, range_end), initial_bytes)) in chunk_iter.enumerate() {
         let pb = mp.insert(i + 1, ProgressBar::new(range_end - range_start + 1));
         pb.set_style(chunk_style.clone());
         pb.set_prefix(format!("Chunk {:2} ", i + 1));
         chunk_pbs.push(pb.clone());
+
+        let chunk_len = range_end - range_start + 1;
+
+        // If we are resuming and this chunk was already fully downloaded, mark it
+        // done immediately and skip spawning a worker task.
+        if initial_bytes >= chunk_len {
+            pb.set_style(chunk_style_done.clone());
+            pb.set_position(chunk_len);
+            pb.finish_with_message("✓");
+
+            let chunk_speed = chunk_speeds[i].clone();
+            chunk_speed.started.store(true, Ordering::Relaxed);
+            chunk_speed.done.store(true, Ordering::Relaxed);
+            if i < chunk_written.len() {
+                chunk_written[i].store(chunk_len, Ordering::Relaxed);
+            }
+            continue;
+        }
+
+        // If we are resuming this chunk (but not complete), advance the progress bar.
+        if initial_bytes > 0 {
+            pb.set_position(initial_bytes);
+        }
 
         let main_pb_clone = main_pb.clone();
         let total_bytes_arc = total_bytes_downloaded.clone();
@@ -404,7 +543,7 @@ async fn main() -> Result<()> {
                 .context("Failed to open file in chunk task")?;
 
             // Bytes already written for this chunk (persists across restart).
-            let mut chunk_bytes: u64 = 0;
+            let mut chunk_bytes: u64 = initial_bytes;
 
             'attempts: for attempt in 0..MAX_ATTEMPTS {
                 let abs_start = range_start + chunk_bytes;
@@ -581,13 +720,25 @@ async fn main() -> Result<()> {
     const RESTART_SUSTAINED_SECS_AGGRESSIVE: u64 = 5;
     const HUNG_DURATION_SECS: u64 = 15;
     const HUNG_BYTES_THRESHOLD: u64 = 64 * 1024; // 64 KiB
+
+    /// How often (in seconds) the supervisor writes the current download
+    /// progress to the resume control file. Lower values give better
+    /// crash recovery at the cost of more disk I/O.
+    const RESUME_SAVE_INTERVAL_SECS: u64 = 5;
+
     let aggressive = args.aggressive;
     let supervisor_speeds = chunk_speeds.clone();
     let supervisor_pbs = chunk_pbs.clone();
     let supervisor_total = total_bytes_downloaded.clone();
+    let supervisor_chunk_ranges = chunk_ranges.clone();
+    let supervisor_url = url.to_string();
+    let supervisor_etag = server_etag.clone();
+    let supervisor_filename = filename.clone();
     let normal_style = chunk_style.clone();
     let slow_style = chunk_style_slow.clone();
     let supervisor_download_complete = download_complete.clone();
+    let supervisor_disable_resume = disable_resume;
+    let supervisor_content_length = content_length;
     let supervisor = tokio::spawn(async move {
         // 800 ms tick reduces CPU wakeups vs 500 ms while still giving
         // sub-second detection latency for hung connections (the hung
@@ -595,6 +746,7 @@ async fn main() -> Result<()> {
         let mut tick = tokio::time::interval(Duration::from_millis(800));
         tick.tick().await; // discard the immediate first tick
         let mut current_slow: Vec<bool> = vec![false; supervisor_speeds.len()];
+        let mut last_resume_save = Instant::now();
         // Per-chunk (last_observed_position, last_observed_time) used by the
         // hung-connection detector. Lazy-initialised the first time we see
         // each chunk active.
@@ -607,6 +759,43 @@ async fn main() -> Result<()> {
             }
 
             let now = Instant::now();
+
+            // ── Periodic resume state saving (throttled) ─────────────
+            // We do this early in the loop (before any `continue`s) so that
+            // progress is persisted even when there are few/no active chunks
+            // left, or when using small RESUME_SAVE_INTERVAL_SECS values.
+            if !supervisor_disable_resume
+                && now.duration_since(last_resume_save)
+                    >= Duration::from_secs(RESUME_SAVE_INTERVAL_SECS)
+            {
+                last_resume_save = now;
+
+                let current_written: Vec<u64> =
+                    supervisor_pbs.iter().map(|pb| pb.position()).collect();
+
+                let progress: Vec<ChunkProgress> = supervisor_chunk_ranges
+                    .iter()
+                    .zip(current_written.iter())
+                    .map(|(&(start, end), &written)| ChunkProgress {
+                        start,
+                        end,
+                        written: written.min(end - start + 1),
+                    })
+                    .collect();
+
+                let state = ResumeState {
+                    version: RESUME_STATE_VERSION,
+                    url: supervisor_url.clone(),
+                    etag: supervisor_etag.clone(),
+                    content_length: supervisor_content_length,
+                    connections: supervisor_speeds.len(),
+                    min_chunk: 0,
+                    chunks: progress,
+                };
+
+                let _ = save_resume_state(&state, &supervisor_filename);
+            }
+
             let total_so_far = supervisor_total.load(Ordering::Relaxed);
             let overall_fraction = total_so_far as f64 / content_length as f64;
 
@@ -752,6 +941,10 @@ async fn main() -> Result<()> {
     for task in tasks {
         task.await??;
     }
+
+    // Download succeeded — remove the resume control file so it doesn't linger.
+    remove_resume_state(&filename);
+
     // Signal supervisor to exit cleanly instead of aborting mid-tick.
     // This avoids leaving progress bars in an inconsistent state on slow terminals.
     download_complete.store(true, Ordering::Relaxed);
@@ -838,13 +1031,18 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Probe a URL for `(content_length, accept_ranges, content_disposition)`.
+/// Probe a URL for metadata needed for multi-connection download.
+///
+/// Returns: `(content_length, accept_ranges, content_disposition, etag)`.
 ///
 /// Tries HEAD first, then falls back to a `Range: bytes=0-0` GET if HEAD
 /// returns a non-success status. The fallback handles signed URLs that
 /// are bound to GET (e.g. S3 presigned URLs) and servers that don't
 /// implement HEAD at all.
-async fn probe_metadata(client: &Client, url: &str) -> Result<(u64, bool, Option<String>)> {
+async fn probe_metadata(
+    client: &Client,
+    url: &str,
+) -> Result<(u64, bool, Option<String>, Option<String>)> {
     let head = client.head(url).send().await?;
 
     if head.status().is_success() {
@@ -864,7 +1062,12 @@ async fn probe_metadata(client: &Client, url: &str) -> Result<(u64, bool, Option
             .get(header::CONTENT_DISPOSITION)
             .and_then(|v| v.to_str().ok())
             .map(String::from);
-        return Ok((cl, ar, cd));
+        let etag = head
+            .headers()
+            .get(header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        return Ok((cl, ar, cd, etag));
     }
 
     eprintln!(
@@ -892,6 +1095,11 @@ async fn probe_metadata(client: &Client, url: &str) -> Result<(u64, bool, Option
         .get(header::CONTENT_DISPOSITION)
         .and_then(|v| v.to_str().ok())
         .map(String::from);
+    let etag = probe
+        .headers()
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
 
     if probe.status() == reqwest::StatusCode::PARTIAL_CONTENT {
         // 206: ranges supported. Total size lives in `Content-Range: bytes 0-0/<total>`.
@@ -903,7 +1111,7 @@ async fn probe_metadata(client: &Client, url: &str) -> Result<(u64, bool, Option
             .filter(|v| *v != "*")
             .and_then(|v| v.parse::<u64>().ok())
             .context("Probe returned 206 without parseable Content-Range total")?;
-        Ok((total, true, cd))
+        Ok((total, true, cd, etag))
     } else {
         // 200: server ignored Range. Single-connection only.
         let total = probe
@@ -912,7 +1120,7 @@ async fn probe_metadata(client: &Client, url: &str) -> Result<(u64, bool, Option
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
             .context("No Content-Length → cannot use multi-connection")?;
-        Ok((total, false, cd))
+        Ok((total, false, cd, etag))
     }
 }
 
@@ -1136,4 +1344,145 @@ async fn compute_hash(algo: HashAlgorithm, path: &Path, spinner: &ProgressBar) -
             "error".to_string()
         }
     }
+}
+
+// ============================================================================
+// Cross-run resume support (control file)
+// ============================================================================
+
+/// Version of the resume control file format.
+const RESUME_STATE_VERSION: u32 = 1;
+
+/// Per-chunk progress stored in the control file.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ChunkProgress {
+    /// Inclusive start byte offset of this chunk.
+    start: u64,
+    /// Inclusive end byte offset of this chunk.
+    end: u64,
+    /// How many bytes have been successfully written for this chunk so far.
+    written: u64,
+}
+
+/// Persistent state for resuming a download across `rget` invocations.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ResumeState {
+    version: u32,
+    /// The original URL being downloaded.
+    url: String,
+    /// ETag returned by the server (if any). Very useful for detecting when
+    /// the remote file has changed.
+    etag: Option<String>,
+    content_length: u64,
+    /// Number of connections used when this state was created.
+    connections: usize,
+    min_chunk: u64,
+    /// Progress for each chunk. The order must match the chunking logic used.
+    chunks: Vec<ChunkProgress>,
+}
+
+/// Returns the path of the control file for a given download target.
+/// We use a hidden file next to the target: `.<name>.rget`
+fn control_path_for(target: &Path) -> PathBuf {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let name = target.file_name().unwrap_or_default();
+    parent.join(format!(".{}.rget", name.to_string_lossy()))
+}
+
+/// Attempt to load and deserialize a resume control file.
+/// Returns `None` if the file does not exist or cannot be parsed.
+fn load_resume_state(target: &Path) -> Option<ResumeState> {
+    let control_path = control_path_for(target);
+    if !control_path.exists() {
+        return None;
+    }
+
+    match std::fs::read_to_string(&control_path) {
+        Ok(content) => match serde_json::from_str::<ResumeState>(&content) {
+            Ok(state) => {
+                if state.version == RESUME_STATE_VERSION {
+                    Some(state)
+                } else {
+                    // Future version or unknown format → ignore.
+                    None
+                }
+            }
+            Err(_) => {
+                // Corrupt or unreadable control file → treat as absent.
+                // We could log a warning, but for now we silently start fresh.
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
+
+/// Atomically write (or update) the resume control file next to the target.
+fn save_resume_state(state: &ResumeState, target: &Path) -> Result<()> {
+    let control_path = control_path_for(target);
+    let tmp_path = control_path.with_extension("rget.tmp");
+
+    let json = serde_json::to_string_pretty(state).context("Failed to serialize resume state")?;
+
+    // Write to a temporary file first for atomicity.
+    std::fs::write(&tmp_path, json).context("Failed to write temporary resume file")?;
+
+    // Best-effort fsync. We ignore errors because not all platforms/filesystems
+    // support it, and a failed fsync is not fatal for resume correctness.
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&tmp_path) {
+        let _ = file.sync_all();
+    }
+
+    // Atomic rename (this is the critical step).
+    std::fs::rename(&tmp_path, &control_path)
+        .context("Failed to atomically replace resume control file")?;
+
+    Ok(())
+}
+
+/// Remove the control file (called on successful completion).
+fn remove_resume_state(target: &Path) {
+    let control_path = control_path_for(target);
+    let _ = std::fs::remove_file(control_path);
+}
+
+/// Validate whether a loaded `ResumeState` is still usable for the current download.
+/// We require at minimum that the content_length matches.
+/// If the server provided an ETag during probing and we have one in the state,
+/// they should match (otherwise the remote file likely changed).
+fn validate_resume_state(state: &ResumeState, content_length: u64, etag: Option<&str>) -> bool {
+    if state.content_length != content_length {
+        return false;
+    }
+
+    if let (Some(stored_etag), Some(current_etag)) = (&state.etag, etag) {
+        if stored_etag != current_etag {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Given an old `ResumeState`, compute how many bytes in the range `[range_start, range_end]`
+/// have already been written according to the previous progress.
+/// This allows resuming even if the user changes `-n` between runs.
+fn compute_already_written_for_range(state: &ResumeState, range_start: u64, range_end: u64) -> u64 {
+    let mut written = 0u64;
+
+    for cp in &state.chunks {
+        // Compute overlap between [cp.start, cp.end] and [range_start, range_end]
+        let overlap_start = range_start.max(cp.start);
+        let overlap_end = range_end.min(cp.end);
+
+        if overlap_start <= overlap_end {
+            // How much of this old chunk was written?
+            let already = cp.written.min(cp.end - cp.start + 1);
+            // How much of the overlap is covered by already-written bytes?
+            let covered = already.saturating_sub(overlap_start.saturating_sub(cp.start));
+            written += covered.min(overlap_end - overlap_start + 1);
+        }
+    }
+
+    written.min(range_end - range_start + 1)
 }
