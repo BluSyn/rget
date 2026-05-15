@@ -5,11 +5,13 @@ use reqwest::{header, Client};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::net::lookup_host;
+use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::sync::Notify;
 use url::Url;
@@ -237,7 +239,10 @@ async fn main() -> Result<()> {
     // Cap progress redraws at 10 Hz to reduce terminal flicker. The actual
     // bar values keep updating at full rate; only the rendered output is
     // throttled.
-    mp.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
+    // 5 Hz redraw target is a good balance: smooth enough for the user while
+    // halving CPU/terminal work compared to 10 Hz. Low-resource machines
+    // benefit from fewer redraw syscalls.
+    mp.set_draw_target(ProgressDrawTarget::stderr_with_hz(5));
 
     // ─── Main (total) progress bar ──────────────────────────────────
     let main_style = ProgressStyle::default_bar()
@@ -280,6 +285,7 @@ async fn main() -> Result<()> {
     let total_bytes_downloaded = Arc::new(AtomicU64::new(0));
     let total_speed_state = Arc::new(Mutex::new((0u64, Instant::now())));
     let total_sample_deadline_ms = Arc::new(AtomicU64::new(400));
+    let download_complete = Arc::new(AtomicBool::new(false));
 
     // ─── Chunking ───────────────────────────────────────────────────
     let effective_n = if accept_ranges {
@@ -422,23 +428,23 @@ async fn main() -> Result<()> {
                 tokio::pin!(cancel_fut);
 
                 loop {
-                    let next_chunk = if cancel_enabled {
+                    let chunk_result = if cancel_enabled {
                         tokio::select! {
                             biased;
                             _ = &mut cancel_fut => {
                                 cancelled = true;
-                                None
+                                break;
                             }
-                            r = resp.chunk() => Some(r),
+                            r = resp.chunk() => r,
                         }
                     } else {
-                        Some(resp.chunk().await)
+                        resp.chunk().await
                     };
 
                     if cancelled {
                         break;
                     }
-                    let chunk = match next_chunk.unwrap() {
+                    let chunk = match chunk_result {
                         Ok(Some(c)) => c,
                         Ok(None) => break,
                         Err(e) => return Err(e.into()),
@@ -471,8 +477,7 @@ async fn main() -> Result<()> {
                     let elapsed_ms = now.duration_since(download_start).as_millis() as u64;
                     if elapsed_ms >= total_sample_deadline_ms_arc.load(Ordering::Relaxed) {
                         let mut state = total_speed_state_arc
-                            .lock()
-                            .expect("total_speed_state mutex poisoned");
+                            .lock();
                         let (last_total_bytes, last_total_time) = &mut *state;
                         let delta_t = now.duration_since(*last_total_time).as_secs_f64();
                         if delta_t >= 0.4 {
@@ -493,14 +498,8 @@ async fn main() -> Result<()> {
                     // for the next attempt.
                     drop(resp);
                     chunk_speed.restart_count.fetch_add(1, Ordering::Relaxed);
-                    *chunk_speed
-                        .lagging_since
-                        .lock()
-                        .expect("lagging_since mutex poisoned") = None;
-                    *chunk_speed
-                        .cooldown_until
-                        .lock()
-                        .expect("cooldown_until mutex poisoned") =
+                    *chunk_speed.lagging_since.lock() = None;
+                    *chunk_speed.cooldown_until.lock() =
                         Some(Instant::now() + Duration::from_secs(15));
 
                     pb.set_style(restart_style.clone());
@@ -561,8 +560,12 @@ async fn main() -> Result<()> {
     let supervisor_total = total_bytes_downloaded.clone();
     let normal_style = chunk_style.clone();
     let slow_style = chunk_style_slow.clone();
+    let supervisor_download_complete = download_complete.clone();
     let supervisor = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_millis(500));
+        // 800 ms tick reduces CPU wakeups vs 500 ms while still giving
+        // sub-second detection latency for hung connections (the hung
+        // threshold itself is 15 s, so this is plenty responsive).
+        let mut tick = tokio::time::interval(Duration::from_millis(800));
         tick.tick().await; // discard the immediate first tick
         let mut current_slow: Vec<bool> = vec![false; supervisor_speeds.len()];
         // Per-chunk (last_observed_position, last_observed_time) used by the
@@ -571,6 +574,10 @@ async fn main() -> Result<()> {
         let mut last_progress: Vec<Option<(u64, Instant)>> = vec![None; supervisor_speeds.len()];
         loop {
             tick.tick().await;
+
+            if supervisor_download_complete.load(Ordering::Relaxed) {
+                break;
+            }
 
             let now = Instant::now();
             let total_so_far = supervisor_total.load(Ordering::Relaxed);
@@ -614,7 +621,6 @@ async fn main() -> Result<()> {
                     && supervisor_speeds[i]
                         .cooldown_until
                         .lock()
-                        .expect("cooldown_until mutex poisoned")
                         .is_some_and(|t| Instant::now() < t)
                 {
                     continue;
@@ -653,7 +659,6 @@ async fn main() -> Result<()> {
                 if state
                     .cooldown_until
                     .lock()
-                    .expect("cooldown_until mutex poisoned")
                     .is_some_and(|t| now < t)
                 {
                     continue;
@@ -694,11 +699,7 @@ async fn main() -> Result<()> {
             if state.restart_count.load(Ordering::Relaxed) >= 1 {
                 continue;
             }
-            if let Some(t) = *state
-                .cooldown_until
-                .lock()
-                .expect("cooldown_until mutex poisoned")
-            {
+            if let Some(t) = *state.cooldown_until.lock() {
                 if Instant::now() < t {
                     continue;
                 }
@@ -712,20 +713,14 @@ async fn main() -> Result<()> {
             };
 
             if frac_ok {
-                let mut lag = state
-                    .lagging_since
-                    .lock()
-                    .expect("lagging_since mutex poisoned");
+                let mut lag = state.lagging_since.lock();
                 let since = lag.get_or_insert_with(Instant::now);
                 if Instant::now().duration_since(*since) >= Duration::from_secs(sustained_secs) {
                     drop(lag);
                     state.restart_notify.notify_one();
                 }
             } else {
-                *state
-                    .lagging_since
-                    .lock()
-                    .expect("lagging_since mutex poisoned") = None;
+                *state.lagging_since.lock() = None;
             }
         }
     });
@@ -734,7 +729,13 @@ async fn main() -> Result<()> {
     for task in tasks {
         task.await??;
     }
-    supervisor.abort();
+    // Signal supervisor to exit cleanly instead of aborting mid-tick.
+    // This avoids leaving progress bars in an inconsistent state on slow terminals.
+    download_complete.store(true, Ordering::Relaxed);
+    // Give the supervisor one final tick to observe the flag and break.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    supervisor.abort(); // still abort in case it's blocked on a long pb.println
+    let _ = supervisor.await;
 
     // ─── Summary ─────────────────────────────────────────────────────
     let total_duration = start_time.elapsed();
@@ -766,28 +767,11 @@ async fn main() -> Result<()> {
             .unwrap(),
     );
     hash_spinner.enable_steady_tick(Duration::from_millis(120));
-    hash_spinner.set_message("Running sha256sum...");
+    hash_spinner.set_message("Hashing file...");
 
-    let output = Command::new("sha256sum").arg(&filename).output().await;
+    let hash_hex = compute_sha256(&filename, &hash_spinner).await;
 
     hash_spinner.finish_and_clear();
-
-    let hash_hex = match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .split_whitespace()
-            .next()
-            .unwrap_or("parse-error")
-            .to_string(),
-        Ok(out) => {
-            eprintln!("sha256sum exited with code {:?}", out.status.code());
-            "error".to_string()
-        }
-        Err(e) => {
-            eprintln!("Cannot run sha256sum: {}", e);
-            "not-available".to_string()
-        }
-    };
-
     println!("SHA-256:           {}", hash_hex);
 
     Ok(())
@@ -880,8 +864,81 @@ fn parse_content_disposition_filename(cd: &str) -> Option<String> {
         if let Some(semi) = val.find(';') {
             val.truncate(semi);
         }
-        Some(val.replace("%20", " "))
+        let cleaned = val.replace("%20", " ");
+        // Return only the basename component; never trust a path with separators
+        // coming from an untrusted server.
+        std::path::Path::new(&cleaned)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty() && s != "." && s != "..")
     } else {
         None
+    }
+}
+
+/// Compute SHA-256 of a file, preferring fast native system tools when available.
+/// Falls back to a pure-Rust implementation (`sha2` crate) if no system hasher works.
+/// This makes the feature portable across Linux, macOS, Windows, and minimal containers.
+async fn compute_sha256(path: &Path, spinner: &ProgressBar) -> String {
+    // Ordered list of (command, args...) to try. The first that succeeds and
+    // produces a plausible 64-char hex string wins.
+    let candidates: &[(&str, &[&str])] = &[
+        ("sha256sum", &[]),
+        ("shasum", &["-a", "256"]),
+        ("sha256", &[]),
+        ("openssl", &["dgst", "-sha256", "-r"]),
+    ];
+
+    for (cmd, args) in candidates {
+        spinner.set_message(format!("Trying {}...", cmd));
+        let mut full_args = args.to_vec();
+        full_args.push(path.to_str().unwrap_or(""));
+        if let Ok(output) = Command::new(cmd).args(&full_args).output().await {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // Many tools output "<hash>  filename" or "<hash> *filename" or just the hash.
+                if let Some(hex) = stdout.split_whitespace().next() {
+                    if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                        return hex.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: pure Rust streaming hash (works everywhere, no external binary needed).
+    spinner.set_message("Using pure-Rust SHA-256 (slower on very large files)...");
+
+    let path = path.to_owned();
+    let result = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        use std::fs::File;
+        use std::io::{BufReader, Read};
+
+        let file = File::open(&path)?;
+        let mut reader = BufReader::with_capacity(1024 * 1024, file); // 1 MiB buffer
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 64 * 1024]; // 64 KiB read chunks
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(hex::encode(hasher.finalize()))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(hex)) => hex,
+        Ok(Err(e)) => {
+            eprintln!("Rust SHA-256 failed: {}", e);
+            "error".to_string()
+        }
+        Err(e) => {
+            eprintln!("SHA-256 task panicked: {}", e);
+            "error".to_string()
+        }
     }
 }
