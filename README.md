@@ -19,6 +19,7 @@ A fast, multi-connection HTTP file downloader written in Rust. Designed to fully
 - HEAD-then-ranged-GET probe so signed URLs (e.g. S3 presigned GETs) work without an extra round trip
 - Batch downloads via multiple URLs or `-i` file, with `--fail-fast`
 - URL range expansion for sharded files (e.g. `model-{001..040}-of-00040.safetensors`)
+- Optional HTTP/3 (QUIC) support for better performance on high-latency/lossy networks (requires `--features http3`)
 
 ## Installation
 
@@ -178,6 +179,39 @@ rget -i models.txt
 # model-{001..040}-of-00040.safetensors
 # https://example.com/other-{01..05}.bin
 ```
+
+## HTTP/3 (QUIC) Support
+
+`rget` can use HTTP/3 (QUIC) when the server supports it. This can provide significantly better performance on high-latency or lossy networks.
+
+### Enabling HTTP/3
+
+HTTP/3 support is **optional** and must be enabled at compile time:
+
+```bash
+RUSTFLAGS="--cfg reqwest_unstable" cargo install --features http3 rget
+```
+
+Or when building from source:
+
+```bash
+RUSTFLAGS="--cfg reqwest_unstable" cargo build --release --features http3
+```
+
+### Usage
+
+```bash
+rget --http3 https://example.com/large-model.safetensors
+```
+
+When `--http3` is passed, `rget` will attempt to use HTTP/3 with prior knowledge (it will not fall back to HTTP/1.1 or HTTP/2).
+
+### Limitations
+
+- Requires building with `reqwest_unstable` cfg flag (HTTP/3 support in reqwest is still considered unstable).
+- Only works with `rustls` (native TLS is not supported for HTTP/3).
+- Binary size increases when the `http3` feature is enabled.
+- QUIC support can be finicky on some networks/firewalls.
 
 ## License
 

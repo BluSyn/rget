@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 
-use governor::{Quota, RateLimiter};
-use governor::state::{InMemoryState, NotKeyed};
 use governor::clock::DefaultClock;
+use governor::state::{InMemoryState, NotKeyed};
+use governor::{Quota, RateLimiter};
 use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -99,6 +99,13 @@ struct Args {
     /// if any download failed.
     #[arg(long)]
     fail_fast: bool,
+
+    /// Use HTTP/3 (QUIC) with prior knowledge.
+    /// This is an opt-in experimental feature.
+    /// Requires compiling with: `RUSTFLAGS="--cfg reqwest_unstable" cargo build --features http3`
+    #[cfg(feature = "http3")]
+    #[arg(long)]
+    http3: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -289,11 +296,19 @@ async fn download_one(
         .context("URL has no port and no known default for its scheme")?;
     let resolved = resolve_host(&host, port, ip_mode).await?;
 
-    let client = Client::builder()
+    #[allow(unused_mut)]
+    let mut client_builder = Client::builder()
         .user_agent("rget/0.1 (multi-connection downloader)")
         .pool_idle_timeout(Duration::from_secs(30))
-        .resolve(&host, resolved)
-        .build()?;
+        .resolve(&host, resolved);
+
+    #[cfg(feature = "http3")]
+    if args.http3 {
+        // Requires `RUSTFLAGS="--cfg reqwest_unstable"` at build time
+        client_builder = client_builder.http3_prior_knowledge();
+    }
+
+    let client = client_builder.build()?;
 
     // ─── Metadata probe ──────────────────────────────────────────────
     // Try HEAD first; fall back to a ranged GET if HEAD fails.
@@ -1596,10 +1611,10 @@ fn parse_speed(input: &str) -> Result<u64> {
     let value: f64 = num_part.parse().context("Invalid number in --limit-rate")?;
 
     let multiplier: u64 = match unit.trim_start_matches(|c: char| c == ' ' || c == 'b') {
-        "" | "b"     => 1,
-        "k" | "kb"   => 1024,
-        "m" | "mb"   => 1024 * 1024,
-        "g" | "gb"   => 1024 * 1024 * 1024,
+        "" | "b" => 1,
+        "k" | "kb" => 1024,
+        "m" | "mb" => 1024 * 1024,
+        "g" | "gb" => 1024 * 1024 * 1024,
         other => bail!(
             "Unknown unit '{}' in --limit-rate. Supported units: K, M, G (case insensitive)",
             other
