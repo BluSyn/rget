@@ -1,17 +1,16 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use parking_lot::Mutex;
 use reqwest::{header, Client};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::net::lookup_host;
-use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::sync::Notify;
 use url::Url;
@@ -42,9 +41,10 @@ struct Args {
     #[arg(short = '6', long = "ipv6")]
     ipv6: bool,
 
-    /// Skip the SHA-256 verification step after download
-    #[arg(long)]
-    no_sha256: bool,
+    /// Skip all checksum verification and reporting after download.
+    /// Mutually exclusive with --sha256 and --sha512.
+    #[arg(long = "no-sha", conflicts_with_all = ["sha256", "sha512"])]
+    no_sha: bool,
 
     /// Aggressive supervisor: once more than half of connections have
     /// finished, restart any active connection still below 50% completion.
@@ -59,6 +59,17 @@ struct Args {
     /// Refuse to overwrite an existing output file (exit instead of prompting)
     #[arg(long)]
     no_overwrite: bool,
+
+    /// Expected SHA-256 checksum (hex). If provided, the download is verified
+    /// and the process exits with an error on mismatch.
+    /// Mutually exclusive with --no-sha.
+    #[arg(long, value_name = "HEX", conflicts_with = "no_sha")]
+    sha256: Option<String>,
+
+    /// Expected SHA-512 checksum (hex). Same semantics as --sha256.
+    /// Mutually exclusive with --no-sha.
+    #[arg(long, value_name = "HEX", conflicts_with = "no_sha")]
+    sha512: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -179,7 +190,7 @@ async fn main() -> Result<()> {
         eprintln!("Warning: Server does not advertise range support → using single connection");
     }
 
-    let filename = args.output.unwrap_or_else(|| {
+    let filename = args.output.clone().unwrap_or_else(|| {
         content_disposition
             .as_deref()
             .and_then(parse_content_disposition_filename)
@@ -192,6 +203,14 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|| PathBuf::from("download.bin"))
             })
     });
+
+    // Collect any hashes we must verify (from --sha256/--sha512 or sidecar files).
+    // Skip entirely if the user passed --no-sha.
+    let expected_hashes = if args.no_sha {
+        Vec::new()
+    } else {
+        collect_expected_hashes(&args, &filename)?
+    };
 
     println!("Downloading {} → {}", url, filename.display());
     println!(
@@ -485,8 +504,7 @@ async fn main() -> Result<()> {
                     // across all tasks instead of on every chunk callback.
                     let elapsed_ms = now.duration_since(download_start).as_millis() as u64;
                     if elapsed_ms >= total_sample_deadline_ms_arc.load(Ordering::Relaxed) {
-                        let mut state = total_speed_state_arc
-                            .lock();
+                        let mut state = total_speed_state_arc.lock();
                         let (last_total_bytes, last_total_time) = &mut *state;
                         let delta_t = now.duration_since(*last_total_time).as_secs_f64();
                         if delta_t >= 0.4 {
@@ -665,11 +683,7 @@ async fn main() -> Result<()> {
                 if now.duration_since(entry.1) < Duration::from_secs(HUNG_DURATION_SECS) {
                     continue;
                 }
-                if state
-                    .cooldown_until
-                    .lock()
-                    .is_some_and(|t| now < t)
-                {
+                if state.cooldown_until.lock().is_some_and(|t| now < t) {
                     continue;
                 }
                 pb.println(format!(
@@ -762,12 +776,32 @@ async fn main() -> Result<()> {
         avg_speed_mib_s, avg_speed_mb_s
     );
 
-    // ─── SHA-256 with spinner ───────────────────────────────────────
-    if args.no_sha256 {
+    // ─── Hash verification / reporting ──────────────────────────────
+    if expected_hashes.is_empty() {
+        if args.no_sha {
+            return Ok(());
+        }
+        // Legacy behavior: just compute and print SHA-256 for the user
+        println!("Computing SHA-256...");
+
+        let hash_spinner = ProgressBar::new_spinner();
+        hash_spinner.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} {msg}")
+                .unwrap(),
+        );
+        hash_spinner.enable_steady_tick(Duration::from_millis(120));
+        hash_spinner.set_message("Hashing file...");
+
+        let hash_hex = compute_hash(HashAlgorithm::Sha256, &filename, &hash_spinner).await;
+
+        hash_spinner.finish_and_clear();
+        println!("SHA-256:           {}", hash_hex);
         return Ok(());
     }
 
-    println!("Computing SHA-256...");
+    // We have one or more hashes to verify (from CLI or sidecars).
+    println!("Verifying checksum(s)...");
 
     let hash_spinner = ProgressBar::new_spinner();
     hash_spinner.set_style(
@@ -776,12 +810,30 @@ async fn main() -> Result<()> {
             .unwrap(),
     );
     hash_spinner.enable_steady_tick(Duration::from_millis(120));
-    hash_spinner.set_message("Hashing file...");
 
-    let hash_hex = compute_sha256(&filename, &hash_spinner).await;
+    let mut all_ok = true;
+    for (algo, expected_hex) in &expected_hashes {
+        hash_spinner.set_message(format!("Computing {}...", algo.name()));
+        let actual = compute_hash(*algo, &filename, &hash_spinner).await;
+
+        if actual == *expected_hex {
+            println!("{}: {}  ✓", algo.name(), actual);
+        } else {
+            eprintln!(
+                "{} mismatch!\n  Expected: {}\n  Actual:   {}",
+                algo.name(),
+                expected_hex,
+                actual
+            );
+            all_ok = false;
+        }
+    }
 
     hash_spinner.finish_and_clear();
-    println!("SHA-256:           {}", hash_hex);
+
+    if !all_ok {
+        bail!("Checksum verification failed");
+    }
 
     Ok(())
 }
@@ -889,64 +941,198 @@ fn parse_content_disposition_filename(cd: &str) -> Option<String> {
 /// Compute SHA-256 of a file, preferring fast native system tools when available.
 /// Falls back to a pure-Rust implementation (`sha2` crate) if no system hasher works.
 /// This makes the feature portable across Linux, macOS, Windows, and minimal containers.
-async fn compute_sha256(path: &Path, spinner: &ProgressBar) -> String {
-    // Ordered list of (command, args...) to try. The first that succeeds and
-    // produces a plausible 64-char hex string wins.
-    let candidates: &[(&str, &[&str])] = &[
-        ("sha256sum", &[]),
-        ("shasum", &["-a", "256"]),
-        ("sha256", &[]),
-        ("openssl", &["dgst", "-sha256", "-r"]),
-    ];
+
+#[allow(clippy::empty_line_after_doc_comments)]
+/// Supported hash algorithms for verification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HashAlgorithm {
+    Sha256,
+    Sha512,
+}
+
+impl HashAlgorithm {
+    fn name(&self) -> &'static str {
+        match self {
+            HashAlgorithm::Sha256 => "SHA-256",
+            HashAlgorithm::Sha512 => "SHA-512",
+        }
+    }
+
+    fn hex_len(&self) -> usize {
+        match self {
+            HashAlgorithm::Sha256 => 64,
+            HashAlgorithm::Sha512 => 128,
+        }
+    }
+
+    /// Return the list of external commands (and their args) to try, in order.
+    fn system_tool_candidates(&self) -> &'static [(&'static str, &'static [&'static str])] {
+        match self {
+            HashAlgorithm::Sha256 => &[
+                ("sha256sum", &[]),
+                ("shasum", &["-a", "256"]),
+                ("sha256", &[]),
+                ("openssl", &["dgst", "-sha256", "-r"]),
+            ],
+            HashAlgorithm::Sha512 => &[
+                ("sha512sum", &[]),
+                ("shasum", &["-a", "512"]),
+                ("sha512", &[]),
+                ("openssl", &["dgst", "-sha512", "-r"]),
+            ],
+        }
+    }
+}
+
+/// Try to find a sidecar hash file next to `filename` (e.g. `model.safetensors.sha256`).
+/// Returns the algorithm and the hex string if a plausible sidecar is found.
+fn find_sidecar_hash(filename: &Path) -> Option<(HashAlgorithm, String)> {
+    let parent = filename.parent().unwrap_or_else(|| Path::new("."));
+    let stem = filename.file_name()?.to_string_lossy();
+
+    for (ext, algo) in [
+        (".sha256", HashAlgorithm::Sha256),
+        (".sha512", HashAlgorithm::Sha512),
+    ] {
+        let candidate = parent.join(format!("{}{}", stem, ext));
+        if let Ok(content) = std::fs::read_to_string(&candidate) {
+            if let Some(hex) = parse_hash_from_sidecar(&content, algo.hex_len()) {
+                return Some((algo, hex));
+            }
+        }
+    }
+    None
+}
+
+fn parse_hash_from_sidecar(content: &str, expected_len: usize) -> Option<String> {
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Take the first whitespace-separated token that looks like the right length hex
+        if let Some(token) = line.split_whitespace().next() {
+            let token = token.trim_matches('*'); // some tools prefix with *
+            if token.len() == expected_len && token.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some(token.to_ascii_lowercase());
+            }
+        }
+    }
+    None
+}
+
+/// Collect all hashes we are expected to verify (from CLI flags and sidecars).
+/// CLI flags take precedence over sidecars for the same algorithm.
+fn collect_expected_hashes(args: &Args, filename: &Path) -> Result<Vec<(HashAlgorithm, String)>> {
+    let mut expected: Vec<(HashAlgorithm, String)> = Vec::new();
+
+    // From CLI
+    if let Some(ref h) = args.sha256 {
+        let hex = normalize_hash_hex(h, HashAlgorithm::Sha256)?;
+        expected.push((HashAlgorithm::Sha256, hex));
+    }
+    if let Some(ref h) = args.sha512 {
+        let hex = normalize_hash_hex(h, HashAlgorithm::Sha512)?;
+        expected.push((HashAlgorithm::Sha512, hex));
+    }
+
+    // From sidecars (only if not already provided via CLI for that algo)
+    if let Some((algo, hex)) = find_sidecar_hash(filename) {
+        let already_have = expected.iter().any(|(a, _)| *a == algo);
+        if !already_have {
+            expected.push((algo, hex));
+        }
+    }
+
+    Ok(expected)
+}
+
+fn normalize_hash_hex(input: &str, algo: HashAlgorithm) -> Result<String> {
+    let cleaned: String = input.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if cleaned.len() != algo.hex_len() {
+        bail!(
+            "Invalid {} hash length: expected {} hex characters, got {}",
+            algo.name(),
+            algo.hex_len(),
+            cleaned.len()
+        );
+    }
+    Ok(cleaned.to_ascii_lowercase())
+}
+
+/// Compute the hash for the given algorithm, using fast system tools when available,
+/// falling back to pure Rust.
+async fn compute_hash(algo: HashAlgorithm, path: &Path, spinner: &ProgressBar) -> String {
+    let candidates = algo.system_tool_candidates();
 
     for (cmd, args) in candidates {
         spinner.set_message(format!("Trying {}...", cmd));
-        let mut full_args = args.to_vec();
+        let mut full_args: Vec<&str> = args.to_vec();
         full_args.push(path.to_str().unwrap_or(""));
         if let Ok(output) = Command::new(cmd).args(&full_args).output().await {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                // Many tools output "<hash>  filename" or "<hash> *filename" or just the hash.
                 if let Some(hex) = stdout.split_whitespace().next() {
-                    if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                        return hex.to_string();
+                    let cleaned: String = hex.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+                    if cleaned.len() == algo.hex_len() {
+                        return cleaned.to_ascii_lowercase();
                     }
                 }
             }
         }
     }
 
-    // Fallback: pure Rust streaming hash (works everywhere, no external binary needed).
-    spinner.set_message("Using pure-Rust SHA-256 (slower on very large files)...");
+    // Pure Rust fallback
+    spinner.set_message(format!(
+        "Using pure-Rust {} (slower on very large files)...",
+        algo.name()
+    ));
 
     let path = path.to_owned();
     let result = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        use sha2::Digest;
         use std::fs::File;
         use std::io::{BufReader, Read};
 
         let file = File::open(&path)?;
-        let mut reader = BufReader::with_capacity(1024 * 1024, file); // 1 MiB buffer
-        let mut hasher = Sha256::new();
-        let mut buf = [0u8; 64 * 1024]; // 64 KiB read chunks
-        loop {
-            let n = reader.read(&mut buf)?;
-            if n == 0 {
-                break;
+        let mut reader = BufReader::with_capacity(1024 * 1024, file);
+        let mut buf = [0u8; 64 * 1024];
+
+        match algo {
+            HashAlgorithm::Sha256 => {
+                let mut hasher = sha2::Sha256::new();
+                loop {
+                    let n = reader.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                }
+                Ok(hex::encode(hasher.finalize()))
             }
-            hasher.update(&buf[..n]);
+            HashAlgorithm::Sha512 => {
+                let mut hasher = sha2::Sha512::new();
+                loop {
+                    let n = reader.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                }
+                Ok(hex::encode(hasher.finalize()))
+            }
         }
-        Ok(hex::encode(hasher.finalize()))
     })
     .await;
 
     match result {
         Ok(Ok(hex)) => hex,
         Ok(Err(e)) => {
-            eprintln!("Rust SHA-256 failed: {}", e);
+            eprintln!("Rust {} failed: {}", algo.name(), e);
             "error".to_string()
         }
         Err(e) => {
-            eprintln!("SHA-256 task panicked: {}", e);
+            eprintln!("{} task panicked: {}", algo.name(), e);
             "error".to_string()
         }
     }
