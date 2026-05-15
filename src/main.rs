@@ -287,6 +287,7 @@ async fn main() -> Result<()> {
 
     let mut succeeded = 0usize;
     let mut failed = 0usize;
+    let mut failed_urls: Vec<String> = Vec::new();
 
     let total = target_urls.len();
 
@@ -302,6 +303,7 @@ async fn main() -> Result<()> {
             Err(e) => {
                 eprintln!("Error downloading {}: {}", url_str, e);
                 failed += 1;
+                failed_urls.push(url_str.clone());
                 if args.fail_fast {
                     break;
                 }
@@ -314,6 +316,13 @@ async fn main() -> Result<()> {
         println!("Total:     {}", total);
         println!("Succeeded: {}", succeeded);
         println!("Failed:    {}", failed);
+
+        if !failed_urls.is_empty() {
+            println!("\nFailed URLs:");
+            for url in &failed_urls {
+                println!("  - {}", url);
+            }
+        }
     }
 
     if failed > 0 {

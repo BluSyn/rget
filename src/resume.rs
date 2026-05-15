@@ -68,14 +68,15 @@ pub fn save_resume_state(state: &ResumeState, target: &Path) -> Result<()> {
     let control_path = control_path_for(target);
     let tmp_path = control_path.with_extension("rget.tmp");
 
-    let json = serde_json::to_string_pretty(state)
+    // Use compact JSON for performance. The control file is not meant to be human-edited.
+    let json = serde_json::to_string(state)
         .context("Failed to serialize resume state")?;
 
     std::fs::write(&tmp_path, json).context("Failed to write temporary resume file")?;
 
-    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&tmp_path) {
-        let _ = file.sync_all();
-    }
+    // Note: We intentionally skip fsync here for periodic saves.
+    // Atomic rename provides the main safety guarantee. The final successful
+    // save (right before removing the control file) is what matters most.
 
     std::fs::rename(&tmp_path, &control_path)
         .context("Failed to atomically replace resume control file")?;

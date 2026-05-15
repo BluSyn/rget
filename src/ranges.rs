@@ -4,6 +4,17 @@
 //! attacks via maliciously crafted range patterns (e.g. from `-i` files or command line).
 
 use regex::Regex;
+use std::sync::OnceLock;
+
+/// Cached regex for range expansion patterns (e.g. `{001..040}`).
+/// Compiled once on first use for a small performance win.
+static RANGE_REGEX: OnceLock<Regex> = OnceLock::new();
+
+fn get_range_regex() -> &'static Regex {
+    RANGE_REGEX.get_or_init(|| {
+        Regex::new(r"\{(\d+)\.\.(\d+)\}").expect("Invalid range regex")
+    })
+}
 
 /// Maximum number of individual numbers that can be generated from a single range.
 /// Example: `{1..10001}` will be rejected.
@@ -20,8 +31,8 @@ pub const MAX_TOTAL_EXPANDED_URLS: usize = 100_000;
 /// Supports multiple independent ranges (cartesian product).
 /// Zero-padding is determined by the number of digits in the **start** of each range.
 pub fn expand_ranges(raw: &str) -> Vec<String> {
-    // Match {digits..digits}, e.g. {001..040} or {1..100}
-    let re = Regex::new(r"\{(\d+)\.\.(\d+)\}").unwrap();
+    // Use cached regex (compiled once)
+    let re = get_range_regex();
 
     // Find all matches with their positions
     let matches: Vec<_> = re.find_iter(raw).collect();
