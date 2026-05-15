@@ -5,6 +5,11 @@ use parking_lot::Mutex;
 use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
+
+use governor::{Quota, RateLimiter};
+use governor::state::{InMemoryState, NotKeyed};
+use governor::clock::DefaultClock;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -76,6 +81,11 @@ struct Args {
     /// Mutually exclusive with --no-sha.
     #[arg(long, value_name = "HEX", conflicts_with = "no_sha")]
     sha512: Option<String>,
+
+    /// Limit the overall download speed (e.g. 50M, 2G, 500K).
+    /// The limit is applied across all connections combined.
+    #[arg(long, value_name = "SPEED")]
+    limit_rate: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -166,6 +176,19 @@ async fn main() -> Result<()> {
     // When true, we completely bypass all resume logic (no reading or writing
     // of .rget control files).
     let disable_resume = args.no_continue;
+
+    // Create global rate limiter if --limit-rate was provided
+    let rate_limiter: Option<Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>> =
+        if let Some(ref speed_str) = args.limit_rate {
+            let bytes_per_sec = parse_speed(speed_str)?;
+            let quota = Quota::per_second(
+                NonZeroU32::new(bytes_per_sec.clamp(1, u32::MAX as u64) as u32)
+                    .context("Invalid rate limit")?,
+            );
+            Some(Arc::new(RateLimiter::direct(quota)))
+        } else {
+            None
+        };
 
     let start_time = Instant::now();
 
@@ -532,6 +555,7 @@ async fn main() -> Result<()> {
         let done_style = chunk_style_done.clone();
         let restart_style = chunk_style_restart.clone();
         let download_start = start_time;
+        let rate_limiter_clone = rate_limiter.clone();
 
         tasks.push(tokio::spawn(async move {
             chunk_speed.started.store(true, Ordering::Relaxed);
@@ -616,6 +640,14 @@ async fn main() -> Result<()> {
                         Ok(None) => break,
                         Err(e) => return Err(e.into()),
                     };
+
+                    // Apply global bandwidth limit if configured
+                    if let Some(ref limiter) = rate_limiter_clone {
+                        let len = chunk.len() as u32;
+                        if let Some(nonzero_len) = NonZeroU32::new(len) {
+                            let _ = limiter.until_n_ready(nonzero_len).await;
+                        }
+                    }
 
                     file.write_all(&chunk).await?;
                     let len = chunk.len() as u64;
@@ -1462,6 +1494,41 @@ fn validate_resume_state(state: &ResumeState, content_length: u64, etag: Option<
     }
 
     true
+}
+
+/// Parse a human-readable speed string (e.g. "50M", "2G", "500K", "1.5M/s")
+/// into bytes per second.
+fn parse_speed(input: &str) -> Result<u64> {
+    let s = input.trim().to_ascii_lowercase();
+    let s = s.strip_suffix("/s").unwrap_or(&s).to_string();
+
+    // Split number and unit
+    let (num_part, unit) = if let Some(pos) = s.find(|c: char| !c.is_ascii_digit() && c != '.') {
+        (&s[..pos], &s[pos..])
+    } else {
+        (s.as_str(), "")
+    };
+
+    let value: f64 = num_part.parse().context("Invalid number in --limit-rate")?;
+
+    let multiplier: u64 = match unit.trim_start_matches(|c: char| c == ' ' || c == 'b') {
+        "" | "b"     => 1,
+        "k" | "kb"   => 1024,
+        "m" | "mb"   => 1024 * 1024,
+        "g" | "gb"   => 1024 * 1024 * 1024,
+        other => bail!(
+            "Unknown unit '{}' in --limit-rate. Supported units: K, M, G (case insensitive)",
+            other
+        ),
+    };
+
+    let bytes_per_sec = (value * multiplier as f64) as u64;
+
+    if bytes_per_sec == 0 {
+        bail!("--limit-rate cannot be zero");
+    }
+
+    Ok(bytes_per_sec)
 }
 
 /// Given an old `ResumeState`, compute how many bytes in the range `[range_start, range_end]`
