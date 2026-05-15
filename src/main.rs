@@ -24,8 +24,14 @@ use url::Url;
 #[derive(Parser)]
 #[command(name = "rget", about = "Simple fast multi-connection HTTP downloader")]
 struct Args {
-    /// The URL to download
-    url: String,
+    /// One or more URLs to download. Can be combined with -i/--input-file.
+    #[arg(num_args = 1..)]
+    urls: Vec<String>,
+
+    /// Read URLs from a file (one URL per line). Lines starting with # are ignored.
+    /// Can be combined with positional URLs.
+    #[arg(short = 'i', long, value_name = "FILE")]
+    input_file: Option<PathBuf>,
 
     /// Output file path (default: filename from URL or Content-Disposition)
     #[arg(short, long)]
@@ -86,6 +92,12 @@ struct Args {
     /// The limit is applied across all connections combined.
     #[arg(long, value_name = "SPEED")]
     limit_rate: Option<String>,
+
+    /// When downloading multiple URLs, stop immediately if any download fails.
+    /// By default, rget continues with the remaining URLs and exits non-zero
+    /// if any download failed.
+    #[arg(long)]
+    fail_fast: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -173,6 +185,26 @@ async fn confirm_overwrite(path: &Path) -> Result<bool> {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
+    // Collect all URLs from positional arguments and/or input file
+    let mut target_urls: Vec<String> = args.urls.clone();
+
+    if let Some(ref path) = args.input_file {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read input file: {}", path.display()))?;
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            target_urls.push(trimmed.to_string());
+        }
+    }
+
+    if target_urls.is_empty() {
+        bail!("No URLs provided. Pass URLs as arguments or use -i/--input-file.");
+    }
+
     // When true, we completely bypass all resume logic (no reading or writing
     // of .rget control files).
     let disable_resume = args.no_continue;
@@ -190,9 +222,44 @@ async fn main() -> Result<()> {
             None
         };
 
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+
+    for url_str in &target_urls {
+        match download_one(url_str, &args, disable_resume, rate_limiter.clone()).await {
+            Ok(()) => {
+                succeeded += 1;
+            }
+            Err(e) => {
+                eprintln!("Error downloading {}: {}", url_str, e);
+                failed += 1;
+                if args.fail_fast {
+                    break;
+                }
+            }
+        }
+    }
+
+    if target_urls.len() > 1 {
+        println!("\nBatch complete: {} succeeded, {} failed.", succeeded, failed);
+    }
+
+    if failed > 0 {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+async fn download_one(
+    url_str: &str,
+    args: &Args,
+    disable_resume: bool,
+    rate_limiter: Option<Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>>,
+) -> Result<()> {
     let start_time = Instant::now();
 
-    let url = Url::parse(&args.url).context("Invalid URL")?;
+    let url = Url::parse(url_str).context("Invalid URL")?;
     let ip_mode = IpMode::from_args(args.ipv4, args.ipv6);
 
     // ─── Resolve hostname honoring -4 / -6 ──────────────────────────
