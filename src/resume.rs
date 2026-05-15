@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 /// Version of the resume control file format.
 pub const RESUME_STATE_VERSION: u32 = 1;
 
+/// Maximum allowed content length in a resume state file.
+/// This should match or be lower than the value used in main.rs.
+const MAX_CONTENT_LENGTH: u64 = 2 * 1024 * 1024 * 1024 * 1024; // 2 TiB
+
 /// Per-chunk progress stored in the control file.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ChunkProgress {
@@ -90,17 +94,34 @@ pub fn remove_resume_state(target: &Path) {
 }
 
 /// Validate whether a loaded `ResumeState` is still usable.
+/// This includes security checks against tampered or malicious control files.
 pub fn validate_resume_state(
     state: &ResumeState,
     content_length: u64,
     etag: Option<&str>,
+    max_content_length: u64,
 ) -> bool {
+    // Basic length match
     if state.content_length != content_length {
         return false;
     }
 
+    // Security: Reject absurd content lengths from corrupted/malicious resume files
+    if state.content_length > max_content_length {
+        return false;
+    }
+
+    // ETag validation (strong indicator the file changed on the server)
     if let (Some(stored_etag), Some(current_etag)) = (&state.etag, etag) {
         if stored_etag != current_etag {
+            return false;
+        }
+    }
+
+    // Per-chunk sanity checks (prevent malicious written values)
+    for cp in &state.chunks {
+        let chunk_size = cp.end.saturating_sub(cp.start) + 1;
+        if cp.written > chunk_size {
             return false;
         }
     }
@@ -128,4 +149,78 @@ pub fn compute_already_written_for_range(
     }
 
     written.min(range_end - range_start + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resume_state_with_huge_content_length_is_invalid() {
+        let state = ResumeState {
+            version: RESUME_STATE_VERSION,
+            url: "https://example.com/huge.bin".to_string(),
+            etag: None,
+            content_length: 10_000_000_000_000, // 10 TB
+            connections: 8,
+            min_chunk: 1_048_576,
+            chunks: vec![],
+        };
+
+        assert!(!validate_resume_state(&state, 10_000_000_000_000, None, MAX_CONTENT_LENGTH));
+    }
+
+    #[test]
+    fn test_resume_state_with_written_beyond_chunk_size_is_invalid() {
+        let state = ResumeState {
+            version: RESUME_STATE_VERSION,
+            url: "https://example.com/test.bin".to_string(),
+            etag: None,
+            content_length: 1000,
+            connections: 1,
+            min_chunk: 1000,
+            chunks: vec![ChunkProgress {
+                start: 0,
+                end: 999,
+                written: 5000, // Clearly malicious
+            }],
+        };
+
+        assert!(!validate_resume_state(&state, 1000, None, MAX_CONTENT_LENGTH));
+    }
+
+    #[test]
+    fn test_normal_resume_state_is_valid() {
+        let state = ResumeState {
+            version: RESUME_STATE_VERSION,
+            url: "https://example.com/model.bin".to_string(),
+            etag: Some("\"abc123\"".to_string()),
+            content_length: 10_000_000,
+            connections: 8,
+            min_chunk: 1_048_576,
+            chunks: vec![
+                ChunkProgress { start: 0, end: 5_000_000, written: 5_000_000 },
+                ChunkProgress { start: 5_000_001, end: 10_000_000, written: 2_000_000 },
+            ],
+        };
+
+        assert!(validate_resume_state(&state, 10_000_000, Some("\"abc123\""), MAX_CONTENT_LENGTH));
+    }
+
+    #[test]
+    fn test_resume_state_respects_custom_max_size() {
+        let state = ResumeState {
+            version: RESUME_STATE_VERSION,
+            url: "https://example.com/file.bin".to_string(),
+            etag: None,
+            content_length: 50_000_000_000, // 50 GB
+            connections: 4,
+            min_chunk: 1_048_576,
+            chunks: vec![],
+        };
+
+        // Should be invalid with default 2TiB? Wait, 50GB is fine. Let's test rejection with small limit
+        assert!(!validate_resume_state(&state, 50_000_000_000, None, 10_000_000_000)); // 10GB cap
+        assert!(validate_resume_state(&state, 50_000_000_000, None, 100_000_000_000)); // 100GB cap
+    }
 }

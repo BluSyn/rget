@@ -1,6 +1,25 @@
 // ======================================================================
-// Module declarations (must be at the very top, before any `use`)
+// rget - Fast multi-connection downloader
 // ======================================================================
+//
+// Organization:
+// - main.rs     → CLI entrypoint + batch loop + download_one() orchestration
+// - cli.rs      → (planned) Args struct
+// - ranges.rs   → URL range expansion
+// - speed.rs    → --limit-rate parsing
+// - hash.rs     → Verification + sidecar detection
+// - resume.rs   → Cross-run resume control files
+//
+// We deliberately keep the large download_one() in this file for now
+// because it is heavily stateful and async. Pure logic has been extracted
+// into modules to enable unit testing.
+// ======================================================================
+
+/// Maximum allowed file size (in bytes).
+/// This protects against malicious servers returning absurd Content-Length values
+/// and against corrupted resume state files.
+pub const MAX_CONTENT_LENGTH: u64 = 2 * 1024 * 1024 * 1024 * 1024; // 2 TiB
+
 mod hash;
 mod ranges;
 mod resume;
@@ -32,6 +51,10 @@ use url::Url;
 
 // === Internal modules (selective imports) ===
 use crate::hash::HashAlgorithm;
+use crate::resume::{
+    ChunkProgress, RESUME_STATE_VERSION, ResumeState, compute_already_written_for_range,
+    load_resume_state, remove_resume_state, save_resume_state, validate_resume_state,
+};
 
 #[derive(Parser)]
 #[command(name = "rget", about = "Simple fast multi-connection HTTP downloader")]
@@ -104,6 +127,12 @@ struct Args {
     /// The limit is applied across all connections combined.
     #[arg(long, value_name = "SPEED")]
     limit_rate: Option<String>,
+
+    /// Maximum allowed file size to download (e.g. 500G, 2T, 100M).
+    /// This protects against malicious servers sending huge Content-Length values
+    /// that could exhaust disk space. Default: 2T (2 TiB)
+    #[arg(long, value_name = "SIZE", default_value = "2T")]
+    max_size: String,
 
     /// When downloading multiple URLs, stop immediately if any download fails.
     /// By default, rget continues with the remaining URLs and exits non-zero
@@ -248,6 +277,10 @@ async fn main() -> Result<()> {
             None
         };
 
+    // Parse --max-size (protects against malicious servers returning huge Content-Length)
+    let max_content_length: u64 = crate::speed::parse_human_size(&args.max_size)
+        .context("Invalid value for --max-size")?;
+
     let mut succeeded = 0usize;
     let mut failed = 0usize;
 
@@ -258,7 +291,7 @@ async fn main() -> Result<()> {
             println!("\n[{} / {}] {}", i + 1, total, url_str);
         }
 
-        match download_one(url_str, &args, disable_resume, rate_limiter.clone()).await {
+        match download_one(url_str, &args, disable_resume, rate_limiter.clone(), max_content_length).await {
             Ok(()) => {
                 succeeded += 1;
             }
@@ -286,11 +319,22 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// Core Download Logic
+// ============================================================================
+// This function is large because it orchestrates the entire download process:
+// metadata probing, resume state, chunking, concurrent workers, supervisor,
+// rate limiting, and verification.
+//
+// We keep it in main.rs for now (instead of a separate download.rs) to avoid
+// excessive coupling and circular dependencies during the current refactor phase.
+
 async fn download_one(
     url_str: &str,
     args: &Args,
     disable_resume: bool,
     rate_limiter: Option<Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>>,
+    max_content_length: u64,
 ) -> Result<()> {
     let start_time = Instant::now();
 
@@ -333,6 +377,15 @@ async fn download_one(
         eprintln!("Warning: Server does not advertise range support → using single connection");
     }
 
+    // Security: Reject absurdly large files (protects against malicious servers)
+    if content_length > max_content_length {
+        bail!(
+            "Content-Length {} exceeds maximum allowed size ({} bytes)",
+            content_length,
+            max_content_length
+        );
+    }
+
     let filename = args.output.clone().unwrap_or_else(|| {
         content_disposition
             .as_deref()
@@ -371,7 +424,7 @@ async fn download_one(
     let mut resuming = false;
 
     if let Some(state) = &resume_state {
-        if !disable_resume && validate_resume_state(state, content_length, server_etag.as_deref()) {
+        if !disable_resume && validate_resume_state(state, content_length, server_etag.as_deref(), max_content_length) {
             if filename.exists() {
                 resuming = true;
                 let already = state.chunks.iter().map(|c| c.written).sum::<u64>();
@@ -1292,32 +1345,5 @@ fn parse_content_disposition_filename(cd: &str) -> Option<String> {
     }
 }
 
-/// Compute SHA-256 of a file, preferring fast native system tools when available.
-/// Falls back to a pure-Rust implementation (`sha2` crate) if no system hasher works.
-/// This makes the feature portable across Linux, macOS, Windows, and minimal containers.
 
-// Hash types and functions have been moved to src/hash.rs
-
-// Old hash code removed — now lives in src/hash.rs
-
-
-/// Collect all hashes we are expected to verify (from CLI flags and sidecars).
-/// CLI flags take precedence over sidecars for the same algorithm.
-// collect_expected_hashes moved to src/hash.rs
-
-
-// normalize_hash_hex moved to src/hash.rs
-// compute_hash and related functions have been moved to src/hash.rs
-
-
-// ============================================================================
-// Cross-run resume support (control file)
-// Resume types are now in src/resume.rs
-use crate::resume::{
-    compute_already_written_for_range, load_resume_state, remove_resume_state, save_resume_state,
-    validate_resume_state, ChunkProgress, ResumeState, RESUME_STATE_VERSION,
-};
-
-// Resume helper functions have been moved to src/resume.rs
-// (control_path_for, load/save/remove/validate_resume_state, compute_already_written_for_range)
 

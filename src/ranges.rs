@@ -1,6 +1,17 @@
 //! URL range expansion logic (e.g. `model-{001..040}-of-00040.safetensors`).
+//!
+//! Security note: This module contains strict limits to prevent denial-of-service
+//! attacks via maliciously crafted range patterns (e.g. from `-i` files or command line).
 
 use regex::Regex;
+
+/// Maximum number of individual numbers that can be generated from a single range.
+/// Example: `{1..10001}` will be rejected.
+pub const MAX_NUMBERS_PER_RANGE: u64 = 10_000;
+
+/// Maximum total number of URLs that can be produced after expanding all ranges.
+/// This prevents combinatorial explosion from multiple ranges in one URL.
+pub const MAX_TOTAL_EXPANDED_URLS: usize = 100_000;
 
 /// Expands range patterns in a URL, e.g.:
 /// `model-{001..040}-of-00040.safetensors` → 40 URLs with zero-padded numbers.
@@ -36,6 +47,13 @@ pub fn expand_ranges(raw: &str) -> Vec<String> {
             continue;
         }
 
+        // Security: Prevent massive memory usage from huge ranges
+        let range_size = end - start + 1;
+        if range_size > MAX_NUMBERS_PER_RANGE {
+            // Abuse detected — return original string (fail closed)
+            return vec![raw.to_string()];
+        }
+
         let width = start_str.len(); // zero-padding width from left side
         let mut variants = Vec::new();
 
@@ -61,6 +79,11 @@ pub fn expand_ranges(raw: &str) -> Vec<String> {
                     new_url.replace_range(pos..pos + mat.as_str().len(), repl);
                 }
                 new_results.push(new_url);
+
+                // Security: Prevent combinatorial explosion (e.g. {1..500}-{1..500})
+                if new_results.len() > MAX_TOTAL_EXPANDED_URLS {
+                    return vec![raw.to_string()];
+                }
             }
         }
         results = new_results;
@@ -128,5 +151,27 @@ mod tests {
         let urls = expand_ranges("model-{10..5}.bin");
         // Should return original string
         assert_eq!(urls, vec!["model-{10..5}.bin"]);
+    }
+
+    #[test]
+    fn test_huge_single_range_is_rejected() {
+        // This would generate 1 million URLs — should be rejected for DoS protection
+        let urls = expand_ranges("model-{1..1000000}.bin");
+        assert_eq!(urls, vec!["model-{1..1000000}.bin"]);
+    }
+
+    #[test]
+    fn test_combinatorial_explosion_is_rejected() {
+        // Three ranges of 200 each = 8 million combinations
+        let urls = expand_ranges("a-{1..200}-b-{1..200}-c-{1..200}.bin");
+        assert_eq!(urls, vec!["a-{1..200}-b-{1..200}-c-{1..200}.bin"]);
+    }
+
+    #[test]
+    fn test_large_but_allowed_range() {
+        let urls = expand_ranges("file-{0001..1000}.dat");
+        assert_eq!(urls.len(), 1000);
+        assert_eq!(urls[0], "file-0001.dat");
+        assert_eq!(urls[999], "file-1000.dat");
     }
 }

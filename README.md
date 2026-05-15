@@ -14,7 +14,7 @@ A fast, multi-connection HTTP file downloader written in Rust. Designed to fully
 - Strict 206-Partial-Content checking so a server that ignores `Range` and returns the full body can never silently corrupt the output
 - IPv4 / IPv6 forcing flags
 - SHA-256 / SHA-512 verification (CLI flags or automatic sidecar `.sha256`/`.sha512` files)
-- Cross-run resume support using hidden control files (`.filename.rget`)
+- Resource protection: `--limit-rate` to cap bandwidth and `--max-size` to prevent disk exhaustion from malicious `Content-Length` values
 - Interactive overwrite prompt by default, with explicit `--overwrite` / `--no-overwrite` flags for non-interactive use
 - HEAD-then-ranged-GET probe so signed URLs (e.g. S3 presigned GETs) work without an extra round trip
 - Batch downloads via multiple URLs or `-i` file, with `--fail-fast`
@@ -63,6 +63,8 @@ rget [OPTIONS] <URL>
 | `--sha512 <HEX>` | Verify the download against the given SHA-512 checksum. Fails the run on mismatch. Sidecar files (`<file>.sha512`) are detected automatically. |
 | `--no-sha` | Skip all checksum computation and verification for this run. |
 | `--no-continue` | Disable cross-run resume support entirely. No resume control file will be read or written. |
+| `--limit-rate <SPEED>` | Limit the overall download speed (e.g. 50M, 2G, 500K). The limit applies across all connections combined. |
+| `--max-size <SIZE>` | Maximum allowed file size (e.g. 500G, 2T, 100M). Protects against malicious servers returning huge `Content-Length` values that could exhaust disk space. Default: 2T. |
 | `-i, --input-file <FILE>` | Read URLs from a file (one per line). Lines starting with `#` are ignored. Can be combined with positional URLs. |
 | `--fail-fast` | When processing multiple URLs, stop immediately on the first failure. |
 | `-h, --help` | Print help. |
