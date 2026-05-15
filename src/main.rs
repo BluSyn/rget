@@ -236,13 +236,22 @@ async fn main() -> Result<()> {
     }
 
     let mp = MultiProgress::new();
-    // Cap progress redraws at 10 Hz to reduce terminal flicker. The actual
-    // bar values keep updating at full rate; only the rendered output is
-    // throttled.
-    // 5 Hz redraw target is a good balance: smooth enough for the user while
-    // halving CPU/terminal work compared to 10 Hz. Low-resource machines
-    // benefit from fewer redraw syscalls.
-    mp.set_draw_target(ProgressDrawTarget::stderr_with_hz(5));
+
+    // Detect available parallelism once at startup (very cheap) and choose a
+    // redraw rate that preserves the snappy 10 Hz feel on normal machines
+    // (≥3 logical cores) while reducing terminal/CPU load on low-core or
+    // container-constrained systems (1 core → 4 Hz, 2 cores → 6 Hz). The
+    // underlying progress values update at full rate; only the render is
+    // throttled. This respects cgroup/Docker/K8s CPU limits automatically.
+    let redraw_hz = match std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+    {
+        1 => 4,
+        2 => 6,
+        _ => 10,
+    };
+    mp.set_draw_target(ProgressDrawTarget::stderr_with_hz(redraw_hz));
 
     // ─── Main (total) progress bar ──────────────────────────────────
     let main_style = ProgressStyle::default_bar()
