@@ -17,6 +17,8 @@ A fast, multi-connection HTTP file downloader written in Rust. Designed to fully
 - Cross-run resume support using hidden control files (`.filename.rget`)
 - Interactive overwrite prompt by default, with explicit `--overwrite` / `--no-overwrite` flags for non-interactive use
 - HEAD-then-ranged-GET probe so signed URLs (e.g. S3 presigned GETs) work without an extra round trip
+- Batch downloads via multiple URLs or `-i` file, with `--fail-fast`
+- URL range expansion for sharded files (e.g. `model-{001..040}-of-00040.safetensors`)
 
 ## Installation
 
@@ -60,6 +62,8 @@ rget [OPTIONS] <URL>
 | `--sha512 <HEX>` | Verify the download against the given SHA-512 checksum. Fails the run on mismatch. Sidecar files (`<file>.sha512`) are detected automatically. |
 | `--no-sha` | Skip all checksum computation and verification for this run. |
 | `--no-continue` | Disable cross-run resume support entirely. No resume control file will be read or written. |
+| `-i, --input-file <FILE>` | Read URLs from a file (one per line). Lines starting with `#` are ignored. Can be combined with positional URLs. |
+| `--fail-fast` | When processing multiple URLs, stop immediately on the first failure. |
 | `-h, --help` | Print help. |
 
 If neither `--overwrite` nor `--no-overwrite` is set and the output file already exists, `rget` will prompt `Overwrite? [Y/n]` on a TTY. Running with a non-TTY stdin (e.g. from a script) without one of those flags is an error rather than a silent default, so you don't accidentally clobber files in CI.
@@ -125,6 +129,54 @@ rget -n 8 https://example.com/huge-model.safetensors
 
 # Start over completely
 rget --overwrite -n 8 https://example.com/huge-model.safetensors
+```
+
+## URL Range Expansion (Sharded Models)
+
+When downloading many similarly named files (very common with sharded AI models), you can use **Bash-style brace expansion** directly in the URL:
+
+```bash
+rget 'https://example.com/model-{001..040}-of-00040.safetensors'
+```
+
+This will automatically expand to 40 URLs:
+- `model-001-of-00040.safetensors`
+- `model-002-of-00040.safetensors`
+- ...
+- `model-040-of-00040.safetensors`
+
+### Zero-padding
+
+The number of digits on the **left side** of the range determines the output width:
+
+- `model-{001..040}-of-00040.safetensors` → `001`, `002`, ..., `040`
+- `model-{1..40}-of-00040.safetensors`   → `1`, `2`, ..., `40`
+
+This is extremely useful for model sharding where filenames use zero-padded indices.
+
+### Multiple Ranges
+
+You can use multiple independent ranges in one URL:
+
+```bash
+rget 'https://example.com/part-{1..8}-chunk-{01..16}.bin'
+```
+
+This expands to `8 × 16 = 128` URLs.
+
+### Usage with Batch Mode
+
+Range expansion works seamlessly with both positional arguments and `-i` files:
+
+```bash
+# From command line
+rget 'model-{001..040}-of-00040.safetensors'
+
+# From a file
+rget -i models.txt
+# models.txt can contain:
+# model-{001..040}-of-00040.safetensors
+# https://example.com/other-{01..05}.bin
 ```
 
 ## License

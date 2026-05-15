@@ -10,6 +10,7 @@ use std::num::NonZeroU32;
 use governor::{Quota, RateLimiter};
 use governor::state::{InMemoryState, NotKeyed};
 use governor::clock::DefaultClock;
+use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -205,6 +206,13 @@ async fn main() -> Result<()> {
         bail!("No URLs provided. Pass URLs as arguments or use -i/--input-file.");
     }
 
+    // Expand any number ranges (e.g. model-{001..040}-of-00040.safetensors)
+    let mut expanded_urls: Vec<String> = Vec::new();
+    for raw in target_urls {
+        expanded_urls.extend(expand_ranges(&raw));
+    }
+    let target_urls = expanded_urls;
+
     // When true, we completely bypass all resume logic (no reading or writing
     // of .rget control files).
     let disable_resume = args.no_continue;
@@ -225,7 +233,13 @@ async fn main() -> Result<()> {
     let mut succeeded = 0usize;
     let mut failed = 0usize;
 
-    for url_str in &target_urls {
+    let total = target_urls.len();
+
+    for (i, url_str) in target_urls.iter().enumerate() {
+        if total > 1 {
+            println!("\n[{} / {}] {}", i + 1, total, url_str);
+        }
+
         match download_one(url_str, &args, disable_resume, rate_limiter.clone()).await {
             Ok(()) => {
                 succeeded += 1;
@@ -240,8 +254,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    if target_urls.len() > 1 {
-        println!("\nBatch complete: {} succeeded, {} failed.", succeeded, failed);
+    if total > 1 {
+        println!("\n=== Batch Summary ===");
+        println!("Total:     {}", total);
+        println!("Succeeded: {}", succeeded);
+        println!("Failed:    {}", failed);
     }
 
     if failed > 0 {
@@ -1596,6 +1613,75 @@ fn parse_speed(input: &str) -> Result<u64> {
     }
 
     Ok(bytes_per_sec)
+}
+
+/// Expands range patterns in a URL, e.g.:
+/// `model-{001..040}-of-00040.safetensors` → 40 URLs with zero-padded numbers.
+/// `model-{1..5}-part-{01..03}.bin` → 5 × 3 = 15 combinations.
+///
+/// Supports multiple independent ranges (cartesian product).
+/// Zero-padding is determined by the number of digits in the **start** of each range.
+fn expand_ranges(raw: &str) -> Vec<String> {
+    // Match {digits..digits}, e.g. {001..040} or {1..100}
+    let re = Regex::new(r"\{(\d+)\.\.(\d+)\}").unwrap();
+
+    // Find all matches with their positions
+    let matches: Vec<_> = re.find_iter(raw).collect();
+
+    if matches.is_empty() {
+        return vec![raw.to_string()];
+    }
+
+    // For each match, compute the list of string replacements (with proper padding)
+    let mut replacements: Vec<Vec<String>> = Vec::new();
+
+    for m in &matches {
+        let caps = re.captures(m.as_str()).unwrap();
+        let start_str = caps.get(1).unwrap().as_str();
+        let end_str = caps.get(2).unwrap().as_str();
+
+        let start: u64 = start_str.parse().unwrap_or(0);
+        let end: u64 = end_str.parse().unwrap_or(0);
+
+        if start > end {
+            // Invalid range, just keep original
+            replacements.push(vec![m.as_str().to_string()]);
+            continue;
+        }
+
+        let width = start_str.len(); // zero-padding width from left side
+        let mut variants = Vec::new();
+
+        for n in start..=end {
+            let s = format!("{:0width$}", n, width = width);
+            variants.push(s);
+        }
+
+        replacements.push(variants);
+    }
+
+    // Generate all combinations using cartesian product
+    let mut results = vec![raw.to_string()];
+
+    for (i, repls) in replacements.iter().enumerate() {
+        let mut new_results = Vec::new();
+        let mat = &matches[i];
+
+        for base in &results {
+            for repl in repls {
+                let mut new_url = base.clone();
+                // Replace only the first occurrence of this specific match
+                // (in case the same pattern appears multiple times, though unlikely)
+                if let Some(pos) = new_url.find(mat.as_str()) {
+                    new_url.replace_range(pos..pos + mat.as_str().len(), repl);
+                }
+                new_results.push(new_url);
+            }
+        }
+        results = new_results;
+    }
+
+    results
 }
 
 /// Given an old `ResumeState`, compute how many bytes in the range `[range_start, range_end]`
